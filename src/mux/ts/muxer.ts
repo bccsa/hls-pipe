@@ -11,7 +11,7 @@
  * to per-language `.aac` files via the phase-5/7b.2 audio coordinator.
  */
 
-import { buildPat, buildPmt, withPointerField } from './pat-pmt.js';
+import { buildPat, buildPmt, buildRegistrationDescriptor, withPointerField } from './pat-pmt.js';
 import { buildPes, StreamId } from './pes.js';
 import { TsPacketWriter } from './packet.js';
 
@@ -23,11 +23,26 @@ export const StreamType = {
   HEVC: 0x24,
   /** ISO/IEC 13818-7 ADTS AAC. */
   AAC_ADTS: 0x0f,
+  /**
+   * PES carrying private data. Used here for WebVTT subtitles — paired with a
+   * registration_descriptor in the PMT carrying the 4CC "VTT " so downstream
+   * demuxers can distinguish it from other private-data uses (DVB AC-3, etc.).
+   */
+  PES_PRIVATE: 0x06,
 } as const;
 
 export const DEFAULT_PMT_PID = 0x1000;
 export const DEFAULT_VIDEO_PID = 0x100;
 export const DEFAULT_AUDIO_PID = 0x101;
+/**
+ * Base PID for inline-muxed subtitle streams. Assigned sequentially in
+ * user-specified language order: first language at 0x110, second at 0x111, …
+ * Sits above the typical audio range (0x101..0x10F) so audio PID assignment
+ * and subtitle PID assignment never collide.
+ */
+export const DEFAULT_SUBTITLE_PID_BASE = 0x110;
+/** 4CC carried in the registration_descriptor for WebVTT subtitle PIDs. */
+export const SUBTITLE_FORMAT_ID_WEBVTT = 'VTT ';
 const PAT_PID = 0x0000;
 
 export interface VideoSampleIn {
@@ -46,6 +61,27 @@ export interface AudioSampleIn {
   data: Uint8Array;
   /** Presentation timestamp in 90 kHz units (DTS = PTS for audio). */
   pts: number;
+}
+
+export interface SubtitleSampleIn {
+  /**
+   * WebVTT cue block bytes (UTF-8). Includes the timing line, optional cue
+   * settings, and text lines, with a trailing newline. One cue per sample.
+   */
+  data: Uint8Array;
+  /**
+   * Absolute presentation timestamp in 90 kHz units (DTS = PTS for subtitles).
+   * Should already be shifted into the same domain as video/audio PTS by the
+   * caller (e.g. by the same `ptsShift` the inline-AV muxer applies).
+   */
+  pts: number;
+}
+
+export interface SubtitleStreamIn {
+  pid: number;
+  /** ISO 639 language code (e.g. "eng"). Emitted as a language descriptor. */
+  language?: string;
+  samples: SubtitleSampleIn[];
 }
 
 export interface MpegTsMuxerOptions {
@@ -166,12 +202,21 @@ export class MpegTsMuxer {
   muxMulti(samples: {
     video: VideoSampleIn[];
     audios: { pid: number; streamType: number; samples: AudioSampleIn[]; language?: string }[];
+    subtitles?: SubtitleStreamIn[];
   }): Uint8Array {
-    if (samples.video.length === 0 && samples.audios.every((a) => a.samples.length === 0)) {
+    const subtitleStreams = samples.subtitles ?? [];
+    if (
+      samples.video.length === 0 &&
+      samples.audios.every((a) => a.samples.length === 0) &&
+      subtitleStreams.every((s) => s.samples.length === 0)
+    ) {
       return new Uint8Array(0);
     }
     // Stream-id allocation: first audio gets 0xC0, second 0xC1, etc.
     const audioStreamIds = samples.audios.map((_, i) => 0xc0 + i);
+    // Subtitle streams all share stream_id 0xBD (private_stream_1) — the PID
+    // is what distinguishes them in the TS, and decoders demux private streams
+    // by PID, not by stream_id.
     const streams = [
       { streamType: this.videoStreamType, pid: this.videoPid },
       ...samples.audios.map((a) => ({
@@ -179,12 +224,19 @@ export class MpegTsMuxer {
         pid: a.pid,
         ...(a.language ? { language: a.language } : {}),
       })),
+      ...subtitleStreams.map((s) => ({
+        streamType: StreamType.PES_PRIVATE,
+        pid: s.pid,
+        ...(s.language ? { language: s.language } : {}),
+        descriptors: [buildRegistrationDescriptor(SUBTITLE_FORMAT_ID_WEBVTT)],
+      })),
     ];
     this.writeTables(streams);
 
     type Task =
       | { kind: 'v'; sample: VideoSampleIn; dts: number }
-      | { kind: 'a'; pid: number; streamId: number; sample: AudioSampleIn; dts: number };
+      | { kind: 'a'; pid: number; streamId: number; sample: AudioSampleIn; dts: number }
+      | { kind: 's'; pid: number; sample: SubtitleSampleIn; dts: number };
     const tasks: Task[] = [
       ...samples.video.map((s) => ({ kind: 'v' as const, sample: s, dts: s.dts })),
       ...samples.audios.flatMap((audio, idx) =>
@@ -192,6 +244,14 @@ export class MpegTsMuxer {
           kind: 'a' as const,
           pid: audio.pid,
           streamId: audioStreamIds[idx]!,
+          sample: s,
+          dts: s.pts,
+        })),
+      ),
+      ...subtitleStreams.flatMap((sub) =>
+        sub.samples.map((s) => ({
+          kind: 's' as const,
+          pid: sub.pid,
           sample: s,
           dts: s.pts,
         })),
@@ -224,13 +284,22 @@ export class MpegTsMuxer {
         }
         firstVideo = false;
         this.writer.writeChunk(this.videoPid, chunk);
-      } else {
+      } else if (task.kind === 'a') {
         const a = task.sample;
         const pes = buildPes({
           streamId: task.streamId,
           payload: a.data,
           pts: a.pts,
           alignment: true,
+        });
+        this.writer.writeChunk(task.pid, { bytes: pes, payloadStart: true });
+      } else {
+        // Subtitle: private_stream_1 PES, PTS only (no DTS), no alignment flag.
+        const s = task.sample;
+        const pes = buildPes({
+          streamId: StreamId.PRIVATE_STREAM_1,
+          payload: s.data,
+          pts: s.pts,
         });
         this.writer.writeChunk(task.pid, { bytes: pes, payloadStart: true });
       }
@@ -264,7 +333,9 @@ export class MpegTsMuxer {
     this.pendingDiscontinuity = true;
   }
 
-  private writeTables(streams: { streamType: number; pid: number; language?: string }[]): void {
+  private writeTables(
+    streams: { streamType: number; pid: number; language?: string; descriptors?: Uint8Array[] }[],
+  ): void {
     const patSection = withPointerField(buildPat(this.programNumber, this.pmtPid, this.psiVersion));
     this.writer.writeChunk(PAT_PID, { bytes: patSection, payloadStart: true });
     const pmtSection = withPointerField(buildPmt(this.programNumber, streams, this.psiVersion));

@@ -24,6 +24,7 @@ import {
 import type { LatencyConfig } from './stream/latency-controller.js';
 import { makeOutputMode, type OutputModeId } from './output/output-mode.js';
 import type { AudioLanguageSelection } from './stream/audio-coordinator.js';
+import type { SubtitleLanguageSelection } from './stream/subtitle-coordinator.js';
 
 interface ParsedArgs {
   url: string;
@@ -38,6 +39,7 @@ interface ParsedArgs {
   audioPreferredGroup: string | undefined;
   alignment: 'auto' | 'mediaSequence' | 'cumulative' | undefined;
   inlineAudioLanguages: 'all' | string[] | undefined;
+  inlineSubtitleLanguages: SubtitleLanguageSelection | undefined;
   allowMonoAudio: boolean;
   /** Initial cumulative media time (seconds). VOD only; ignored on live. */
   startTimeSec: number | undefined;
@@ -64,6 +66,7 @@ function parseArgs(argv: string[]): ParsedArgs {
   let inlineAudioLanguages: 'all' | string[] | undefined;
   let inlineAudioExplicit = false;
   let disableInlineAudio = false;
+  let inlineSubtitleLanguages: SubtitleLanguageSelection | undefined;
   let allowMonoAudio = false;
   let startTimeSec: number | undefined;
   let verbose = false;
@@ -137,6 +140,18 @@ function parseArgs(argv: string[]): ParsedArgs {
       }
     } else if (arg === '--no-inline-audio') {
       disableInlineAudio = true;
+    } else if (arg.startsWith('--inline-subtitles=')) {
+      const v = arg.slice('--inline-subtitles='.length).trim();
+      if (v === 'all') {
+        inlineSubtitleLanguages = 'all';
+      } else if (v.length === 0) {
+        process.stderr.write(
+          `error: --inline-subtitles= requires a comma-separated language list or "all"\n`,
+        );
+        process.exit(2);
+      } else {
+        inlineSubtitleLanguages = v.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+      }
     } else if (arg === '--allow-mono-audio') {
       allowMonoAudio = true;
     } else if (arg.startsWith('--align=')) {
@@ -182,6 +197,10 @@ function parseArgs(argv: string[]): ParsedArgs {
     process.stderr.write(`error: --inline-audio requires --output=ts-canonical\n`);
     process.exit(2);
   }
+  if (inlineSubtitleLanguages && outputMode !== 'ts-canonical') {
+    process.stderr.write(`error: --inline-subtitles requires --output=ts-canonical\n`);
+    process.exit(2);
+  }
   // Default behavior: with ts-canonical output and no explicit --inline-audio
   // or --no-inline-audio, inline-mux ALL audio renditions (subject to the
   // channel filter). Users get one multi-stream TS by default.
@@ -208,6 +227,7 @@ function parseArgs(argv: string[]): ParsedArgs {
     audioPreferredGroup,
     alignment,
     inlineAudioLanguages,
+    inlineSubtitleLanguages,
     allowMonoAudio,
     startTimeSec,
     verbose,
@@ -289,6 +309,15 @@ function printUsage(): void {
     '                        VLC, browsers) honor language tags and aren\'t affected.',
     '                        Supports fMP4 and raw-ADTS (with ID3 PTS) audio renditions.',
     '  --no-inline-audio     disable inline audio multiplexing (video-only canonical TS)',
+    '  --inline-subtitles=<spec>  multiplex subtitle renditions inline as private PIDs',
+    '                        spec: comma-separated language codes / names or "all"',
+    '                        e.g., --inline-subtitles=eng,nor',
+    '                        Subtitle PIDs are stream_type 0x06 carrying WebVTT cue',
+    '                        blocks (one cue per PES on private_stream_1, 0xBD).',
+    '                        PMT tags each PID with an ISO 639 language descriptor',
+    '                        and a registration_descriptor with 4CC \"VTT \".',
+    '                        Requires --output=ts-canonical and a master playlist',
+    '                        with EXT-X-MEDIA TYPE=SUBTITLES entries.',
     '  --allow-mono-audio    allow mono audio groups when picking the inline-audio',
     '                        source. Default: prefer stereo+ groups when present and',
     '                        fall back to mono only if no stereo+ group is available.',
@@ -358,6 +387,9 @@ async function main(): Promise<void> {
     ...(args.audioPreferredGroup ? { audioPreferredGroup: args.audioPreferredGroup } : {}),
     ...(args.alignment ? { alignment: args.alignment } : {}),
     ...(args.inlineAudioLanguages ? { inlineAudioLanguages: args.inlineAudioLanguages } : {}),
+    ...(args.inlineSubtitleLanguages
+      ? { inlineSubtitleLanguages: args.inlineSubtitleLanguages }
+      : {}),
     ...(args.allowMonoAudio ? { allowMonoAudio: true } : {}),
     ...(args.startTimeSec !== undefined ? { startTimeSec: args.startTimeSec } : {}),
     log: args.verbose ? (msg) => process.stderr.write(`hls-pipe: ${msg}\n`) : undefined,

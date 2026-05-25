@@ -49,12 +49,18 @@ import { type OutputMode, TsPassthroughMode, TsCanonicalMode } from '../output/o
 import { Fmp4AudioExtractor } from '../demux/fmp4/audio.js';
 import { Fmp4VideoExtractor } from '../demux/fmp4/video.js';
 import { extractAacFrames } from '../demux/raw-aac.js';
-import { MpegTsMuxer, DEFAULT_AUDIO_PID } from '../mux/ts/muxer.js';
+import { MpegTsMuxer, DEFAULT_AUDIO_PID, DEFAULT_SUBTITLE_PID_BASE } from '../mux/ts/muxer.js';
 import { StreamType } from '../demux/pat-pmt.js';
 import { detectByContent } from './audio-format.js';
 import type { AlternateRendition } from '../types.js';
 import { groupHasStereo, groupIsAllMono, renditionMaxChannels } from './rendition-filters.js';
 import { AudioCoordinator, type AudioLanguageSelection } from './audio-coordinator.js';
+import {
+  SubtitleCoordinator,
+  type SubtitleLanguageSelection,
+  type SubtitleTrackBinding,
+} from './subtitle-coordinator.js';
+import type { WebVttCue } from '../parser/webvtt-parser.js';
 import type { MasterPlaylist } from '../types.js';
 import { KeyCache } from '../crypt/key-cache.js';
 import { decryptAes128Cbc, deriveIv, UnsupportedKeyMethodError } from '../crypt/decrypter.js';
@@ -132,6 +138,16 @@ export interface ExtractorOptions {
    */
   allowMonoAudio?: boolean;
   /**
+   * One or more subtitle rendition languages to multiplex inline with video
+   * in `--output=ts-canonical`. Each language becomes its own subtitle PID
+   * (stream_type 0x06, stream_id 0xBD private_stream_1) carrying WebVTT cues
+   * in their original cue-block form. The PMT marks each PID with an ISO-639
+   * language descriptor and a registration_descriptor("VTT "). Pass `'all'`
+   * to include every subtitle language from the master playlist. Empty list
+   * / undefined means no subtitle PIDs.
+   */
+  inlineSubtitleLanguages?: SubtitleLanguageSelection;
+  /**
    * Initial cumulative media time (seconds) to start at. **VOD only.** On
    * live streams a warning is logged and the value is ignored. Out-of-range
    * values are clamped to `[0, totalDuration − lastSegmentDuration]` with a
@@ -180,6 +196,14 @@ interface ExtractorState {
    */
   inlineAudios: InlineAudioContext[];
   /**
+   * Inline-subtitle contexts. One per subtitle language. Each owns its TS
+   * subtitle PID (assigned at bootstrap from DEFAULT_SUBTITLE_PID_BASE) and
+   * a per-language cue buffer that the SubtitleCoordinator's rendition
+   * extractors append to. The main loop's `muxInlineAv` drains the buffers
+   * each iteration.
+   */
+  inlineSubtitles: InlineSubtitleContext[];
+  /**
    * Monotonic counter bumped by every successful `seek()` call. The main loop
    * snapshots this at iteration start; if it changes before the iteration's
    * post-write cursor advance, we skip the advance so the seek's cursor
@@ -208,6 +232,22 @@ interface InlineAudioContext {
   lastEmittedPts: number | undefined;
 }
 
+interface InlineSubtitleContext {
+  rendition: AlternateRendition;
+  /** Stable TS PID for this language in the canonical multi-stream TS. */
+  pid: number;
+  /** Display label used in log messages. */
+  label: string;
+  /** Stable language key (lowercased language or name). */
+  langKey: string;
+  /**
+   * Cue buffer — appended to by `SubtitleCoordinator`'s rendition extractor
+   * for this language, drained by `muxInlineAv` per video segment.
+   * Cues are in append (and therefore PTS-ascending) order.
+   */
+  cueBuffer: WebVttCue[];
+}
+
 export class Extractor {
   private readonly opts: ExtractorOptions;
   private readonly loader: Loader;
@@ -223,6 +263,8 @@ export class Extractor {
   private readonly keyCache: KeyCache;
   /** Set when an audio coordinator is configured (phase 5 + phase 7.audio-abr). */
   private audioCoordinator: AudioCoordinator | undefined;
+  /** Set when inline-subtitle muxing is configured. */
+  private subtitleCoordinator: SubtitleCoordinator | undefined;
   /**
    * Stream-lifetime muxer for inline-AV output. Reused across segments so CC
    * counters and PCR continue cleanly — a fresh muxer per segment would cause
@@ -269,8 +311,11 @@ export class Extractor {
     // Audio-ABR coupling (phase 7.audio-abr): make the coordinator available
     // to the main loop so it can notify on each ABR variant switch.
     this.audioCoordinator = audio;
+    const subtitle = this.maybeMakeSubtitleCoordinator(state);
+    this.subtitleCoordinator = subtitle;
     const tasks: Promise<void>[] = [this.runMainLoop(state)];
     if (audio) tasks.push(audio.run());
+    if (subtitle) tasks.push(subtitle.run());
 
     const results = await Promise.allSettled(tasks);
     for (const r of results) {
@@ -373,6 +418,11 @@ export class Extractor {
     }
     // Per-file audio coordinator: forward to every rendition extractor.
     if (this.audioCoordinator) await this.audioCoordinator.seek(clamped);
+    // Inline-subtitle coordinator: forward, and drop buffered cues — they
+    // belong to the pre-seek timeline and would emit at wrong positions
+    // after the seek otherwise.
+    for (const ctx of state.inlineSubtitles) ctx.cueBuffer.length = 0;
+    if (this.subtitleCoordinator) await this.subtitleCoordinator.seek(clamped);
     // Discontinuity signaling — PTS will jump, decoders must reset.
     this.outputMode.resetContiguity?.();
     this.inlineAvMuxer.signalDiscontinuity();
@@ -467,6 +517,9 @@ export class Extractor {
         if (this.audioCoordinator) {
           this.audioCoordinator.onVideoVariantChange(state.variants[nextLevelIdx]!);
         }
+        if (this.subtitleCoordinator) {
+          this.subtitleCoordinator.onVideoVariantChange(state.variants[nextLevelIdx]!);
+        }
         // Variant switches typically change SPS/PPS (and may change codec
         // profile, resolution, frame rate). Signal a TS-level discontinuity
         // so downstream decoders re-initialize — otherwise ffmpeg can try to
@@ -501,7 +554,8 @@ export class Extractor {
 
       // Skip-to-live if configured and we've fallen too far behind.
       if (state.isLive) {
-        const skipTo = this.latency.recommendedSkipTarget(this.opts.liveStartOffsetSegments ?? 6);
+        const liveOffset = this.opts.liveStartOffsetSegments ?? 6;
+        const skipTo = this.latency.recommendedSkipTarget(liveOffset);
         if (skipTo !== undefined && skipTo > state.cursorMediaSequence) {
           const dropped = skipTo - state.cursorMediaSequence;
           this.log(
@@ -509,6 +563,21 @@ export class Extractor {
           );
           state.cursorMediaSequence = skipTo;
           this.latency.setCursor(skipTo);
+          // Inline-subtitle: each rendition extractor runs independently with
+          // its own cursor in its own playlist's media-sequence space — it
+          // does NOT auto-follow video like inline-audio (which is looked up
+          // per video segment by mediaSequence in `collectAudioFramesForSegment`).
+          // Without this fan-out, the subtitle extractor would keep emitting
+          // cues whose PTS is far behind the new video PTS after a stall-skip.
+          // Also flush any cues already drained into per-language buffers —
+          // those belong to the pre-skip timeline.
+          if (this.subtitleCoordinator && state.inlineSubtitles.length > 0) {
+            for (const ctx of state.inlineSubtitles) ctx.cueBuffer.length = 0;
+            // Fire-and-forget: the coordinator awaits its own playlist
+            // refresh internally. Keeping it non-blocking here matches the
+            // main loop's existing pattern of synchronous cursor bumps.
+            void this.subtitleCoordinator.skipToLive(liveOffset);
+          }
         }
       }
 
@@ -564,10 +633,19 @@ export class Extractor {
       // Decrypt AES-128 before any format-specific transform.
       const plaintext = await this.maybeDecrypt(fetched.body, segment);
 
-      // Inline-audio path (phase 7b.3.2 + multi-language): mux video + N
-      // audio streams into one TS. Bypasses outputMode.transform.
-      if (state.inlineAudios.length > 0 && this.outputMode instanceof TsCanonicalMode) {
-        const muxedBytes = await this.muxInlineAv(plaintext, segment, state.inlineAudios);
+      // Inline-audio / inline-subtitle path (phase 7b.3.2 + multi-language +
+      // inline-subtitle): mux video + N audio + N subtitle streams into one
+      // TS. Bypasses outputMode.transform.
+      if (
+        (state.inlineAudios.length > 0 || state.inlineSubtitles.length > 0) &&
+        this.outputMode instanceof TsCanonicalMode
+      ) {
+        const muxedBytes = await this.muxInlineAv(
+          plaintext,
+          segment,
+          state.inlineAudios,
+          state.inlineSubtitles,
+        );
         await this.opts.sink.write(muxedBytes, segment.duration);
       } else {
         // Transform via the output mode; zero-length output still advances the
@@ -604,6 +682,7 @@ export class Extractor {
     videoBytes: Uint8Array,
     videoSegment: Segment,
     audios: InlineAudioContext[],
+    subtitles: InlineSubtitleContext[] = [],
   ): Promise<Uint8Array> {
     const tsMode = this.outputMode as TsCanonicalMode;
     const videoSamples = tsMode.extractVideoSamples(videoBytes);
@@ -676,7 +755,30 @@ export class Extractor {
       }];
     });
 
-    return this.inlineAvMuxer.muxMulti({ video: videoSamples, audios: audioStreams });
+    // Drain each subtitle context's cue buffer. Cues carry absolute 90 kHz
+    // PTS from the WebVTT parser; we apply the same ptsShift the audio path
+    // applies so subtitles stay in sync with the (shifted) video timeline.
+    // Buffer is monotonically PTS-ascending (cues appended in segment order
+    // by the background subtitle extractor).
+    const subtitleStreams = subtitles.flatMap((sub) => {
+      const cues = sub.cueBuffer.splice(0);
+      if (cues.length === 0) return [];
+      const lang = sub.rendition.language;
+      return [{
+        pid: sub.pid,
+        samples: cues.map((c) => ({
+          data: c.payload,
+          pts: c.pts + ptsShift,
+        })),
+        ...(lang ? { language: lang } : {}),
+      }];
+    });
+
+    return this.inlineAvMuxer.muxMulti({
+      video: videoSamples,
+      audios: audioStreams,
+      subtitles: subtitleStreams,
+    });
   }
 
   /**
@@ -884,6 +986,11 @@ export class Extractor {
 
     // Phase 7b.3.2 + multi-language inline-audio bootstrap.
     const inlineAudios = await this.bootstrapInlineAudios(master);
+    // Inline-subtitle bootstrap (private PIDs starting at 0x110).
+    const inlineSubtitles = this.bootstrapInlineSubtitles(
+      master,
+      variants[startLevel]!.subtitleGroup,
+    );
 
     return {
       variants,
@@ -898,6 +1005,7 @@ export class Extractor {
       alignment,
       previousLevelIdx: startLevel,
       inlineAudios,
+      inlineSubtitles,
       seekEpoch: 0,
     };
   }
@@ -1043,6 +1151,172 @@ export class Extractor {
       nextPid++;
     }
     return ctxs;
+  }
+
+  /**
+   * Inline-subtitle bootstrap. Mirrors `bootstrapInlineAudios` selection
+   * semantics: filter by language-or-name, preserve user-specified order,
+   * pick the SUBTITLES group covering the most requested languages (tied
+   * groups break in favour of the one the start variant advertises), dedupe
+   * by `isDefault=true` within a group. PIDs assigned from
+   * DEFAULT_SUBTITLE_PID_BASE in user order.
+   *
+   * Unlike audio, subtitles don't need a media-playlist preload — the
+   * SubtitleRenditionExtractor loads its own when it starts. We just need
+   * to pick the rendition + assign the PID + create the cue buffer here.
+   *
+   * Returns [] when no inline-subtitle selection is configured. Throws when
+   * a non-empty selection cannot be satisfied (no matching renditions, or
+   * not running in `ts-canonical` mode).
+   */
+  private bootstrapInlineSubtitles(
+    master: MasterPlaylist | undefined,
+    initialVariantSubtitleGroup: string | undefined,
+  ): InlineSubtitleContext[] {
+    const sel = this.opts.inlineSubtitleLanguages;
+    if (!sel || (Array.isArray(sel) && sel.length === 0)) return [];
+    if (!(this.outputMode instanceof TsCanonicalMode)) {
+      throw new Error(
+        'inlineSubtitleLanguages requires outputMode = ts-canonical (current mode does not support inline subtitles)',
+      );
+    }
+    if (!master) {
+      throw new Error('inlineSubtitleLanguages requires a master playlist with subtitle renditions');
+    }
+    if (master.subtitles.length === 0) {
+      throw new Error('inlineSubtitleLanguages: master playlist has no subtitle renditions');
+    }
+
+    // 1. Filter master.subtitles by the requested languages (or take all),
+    //    preserving user list order so PMT entries land in that order.
+    const wantedList = sel === 'all' ? undefined : sel.map((s) => s.toLowerCase());
+    const wantedSet = wantedList ? new Set(wantedList) : undefined;
+    const matchedByLang = new Map<string, AlternateRendition[]>();
+    if (wantedList) {
+      for (const lang of wantedList) matchedByLang.set(lang, []);
+    }
+    for (const r of master.subtitles) {
+      if (!r.uri) continue;
+      const langKey = (r.language ?? r.name).toLowerCase();
+      const nameKey = r.name ? r.name.toLowerCase() : undefined;
+      let key: string;
+      if (!wantedSet) {
+        key = langKey;
+      } else if (wantedSet.has(langKey)) {
+        key = langKey;
+      } else if (nameKey && wantedSet.has(nameKey)) {
+        key = nameKey;
+      } else {
+        continue;
+      }
+      if (!matchedByLang.has(key)) matchedByLang.set(key, []);
+      matchedByLang.get(key)!.push(r);
+    }
+    for (const [k, v] of matchedByLang) {
+      if (v.length === 0) matchedByLang.delete(k);
+    }
+    if (matchedByLang.size === 0) {
+      throw new Error(
+        `inlineSubtitleLanguages: none of [${(sel === 'all' ? ['all'] : sel).join(',')}] found in master.subtitles`,
+      );
+    }
+
+    // 2. Build candidateGroups; pick group covering most languages.
+    //    Tiebreak: prefer the group the start variant declares (so we begin
+    //    on the same SUBTITLES group video advertises).
+    const candidateGroups = new Map<string, AlternateRendition[]>();
+    for (const langRenditions of matchedByLang.values()) {
+      for (const r of langRenditions) {
+        if (!candidateGroups.has(r.groupId)) candidateGroups.set(r.groupId, []);
+        candidateGroups.get(r.groupId)!.push(r);
+      }
+    }
+    let bestGroup: string | undefined;
+    let bestCoverage = -1;
+    let bestIsVariantGroup = false;
+    for (const [g, rs] of candidateGroups) {
+      const langs = new Set(rs.map((r) => (r.language ?? r.name).toLowerCase()));
+      const coverage = langs.size;
+      const isVariantGroup = g === initialVariantSubtitleGroup;
+      if (
+        coverage > bestCoverage ||
+        (coverage === bestCoverage && !bestIsVariantGroup && isVariantGroup)
+      ) {
+        bestGroup = g;
+        bestCoverage = coverage;
+        bestIsVariantGroup = isVariantGroup;
+      }
+    }
+    if (!bestGroup) {
+      throw new Error('inlineSubtitleLanguages: failed to resolve a suitable SUBTITLES group');
+    }
+    this.log(
+      `inline-subtitle: selected group=${bestGroup} covering ${bestCoverage} language(s)${bestIsVariantGroup ? ' (matches start variant)' : ''}`,
+    );
+
+    // 3. For each requested language, pick its rendition in the chosen group.
+    //    Dedupe duplicates inside the group by preferring DEFAULT.
+    const ctxs: InlineSubtitleContext[] = [];
+    let nextPid = DEFAULT_SUBTITLE_PID_BASE;
+    for (const [langKey, langRenditions] of matchedByLang) {
+      const candidates = langRenditions.filter((r) => r.groupId === bestGroup);
+      if (candidates.length === 0) {
+        this.log(
+          `inline-subtitle: language=${langKey} missing in group=${bestGroup}; skipped`,
+        );
+        continue;
+      }
+      const rendition =
+        candidates.find((r) => r.isDefault) ?? candidates[0]!;
+      const label = rendition.language ?? rendition.name;
+      this.log(
+        `inline-subtitle[${label}]: PID=0x${nextPid.toString(16)} group=${rendition.groupId} uri=${rendition.uri}`,
+      );
+      ctxs.push({
+        rendition,
+        pid: nextPid,
+        label,
+        langKey,
+        cueBuffer: [],
+      });
+      nextPid++;
+    }
+    return ctxs;
+  }
+
+  private maybeMakeSubtitleCoordinator(state: ExtractorState): SubtitleCoordinator | undefined {
+    if (state.inlineSubtitles.length === 0) return undefined;
+    if (!state.master) return undefined;
+    // The bootstrap step already picked a chosen group — pass it through so
+    // the coordinator only fires onVideoVariantChange when the new variant
+    // names a DIFFERENT group.
+    const initialGroup = state.inlineSubtitles[0]!.rendition.groupId;
+    const tracks: SubtitleTrackBinding[] = state.inlineSubtitles.map((ctx) => ({
+      langKey: ctx.langKey,
+      rendition: ctx.rendition,
+      onCues: (cues) => {
+        // Append in PTS-ascending order. The rendition extractor processes
+        // segments sequentially, so cues from a single call are already in
+        // PTS order; concatenation preserves that across calls.
+        for (const c of cues) ctx.cueBuffer.push(c);
+      },
+    }));
+    const coordOpts: ConstructorParameters<typeof SubtitleCoordinator>[0] = {
+      master: state.master,
+      tracks,
+      initialGroup,
+      loader: this.loader,
+    };
+    if (this.opts.signal) coordOpts.signal = this.opts.signal;
+    if (this.opts.log) coordOpts.log = this.opts.log;
+    if (this.opts.liveStartOffsetSegments !== undefined) {
+      coordOpts.liveStartOffsetSegments = this.opts.liveStartOffsetSegments;
+    }
+    coordOpts.pauseGate = () => this.pauseGate;
+    if (!state.isLive && this.opts.startTimeSec !== undefined && this.opts.startTimeSec > 0) {
+      coordOpts.initialPlayheadSec = state.playheadSec;
+    }
+    return new SubtitleCoordinator(coordOpts);
   }
 
   // -- segment fetch with abandon --------------------------------------------

@@ -72,6 +72,9 @@ See [NOTICE](./NOTICE) for the full attribution.
 | [src/stream/audio-format.ts](src/stream/audio-format.ts) | n/a | Fresh — URI + content sniff to distinguish AAC / TS / fMP4 |
 | [src/stream/audio-rendition-extractor.ts](src/stream/audio-rendition-extractor.ts) | [src/controller/audio-stream-controller.ts](../hls.js/src/controller/audio-stream-controller.ts) | Fresh, inspired-by — single-rendition loop |
 | [src/stream/audio-coordinator.ts](src/stream/audio-coordinator.ts) | n/a (new concept) | Fresh — spawns N rendition extractors, picks one GROUP-ID |
+| [src/parser/webvtt-parser.ts](src/parser/webvtt-parser.ts) | n/a | Fresh — WebVTT cue tokenizer with X-TIMESTAMP-MAP |
+| [src/stream/subtitle-rendition-extractor.ts](src/stream/subtitle-rendition-extractor.ts) | [src/controller/subtitle-stream-controller.ts](../hls.js/src/controller/subtitle-stream-controller.ts) | Fresh, inspired-by — single-rendition WebVTT fetch loop with cue-carryover dedup |
+| [src/stream/subtitle-coordinator.ts](src/stream/subtitle-coordinator.ts) | n/a (new concept) | Fresh — sibling of audio-coordinator for SUBTITLES groups |
 | [src/crypt/decrypter.ts](src/crypt/decrypter.ts) | [src/crypt/decrypter.ts](../hls.js/src/crypt/decrypter.ts) (algorithm) | Fresh, inspired-by — uses Node WebCrypto (we skipped the pure-JS AES port) |
 | [src/crypt/key-cache.ts](src/crypt/key-cache.ts) | [src/loader/key-loader.ts](../hls.js/src/loader/key-loader.ts) | Fresh, simpler than upstream |
 | [src/demux/video/nal-framing.ts](src/demux/video/nal-framing.ts) | [src/demux/video/base-video-parser.ts](../hls.js/src/demux/video/base-video-parser.ts) (parseNALu) | Fresh, inspired-by — stateless scanner (segment-at-a-time vs hls.js FSM) |
@@ -84,9 +87,9 @@ See [NOTICE](./NOTICE) for the full attribution.
 | [src/demux/fmp4/avc-config.ts](src/demux/fmp4/avc-config.ts) | n/a (hls.js parses avcC inside its remuxer) | Fresh — extracts SPS/PPS + lengthSize from `avcC` |
 | [src/demux/fmp4/video.ts](src/demux/fmp4/video.ts) | n/a | Fresh — fMP4 video samples with Annex-B + 90kHz PTS |
 | [src/mux/ts/packet.ts](src/mux/ts/packet.ts) | n/a (hls.js only reads TS) | Fresh — 188-byte packetizer with continuity counter + AF stuffing + PCR |
-| [src/mux/ts/pat-pmt.ts](src/mux/ts/pat-pmt.ts) | n/a | Fresh — PAT/PMT section builders + CRC-32/MPEG-2 |
-| [src/mux/ts/pes.ts](src/mux/ts/pes.ts) | inverse of [src/demux/pes.ts](src/demux/pes.ts) | Fresh — PES header + 33-bit PTS/DTS encoding |
-| [src/mux/ts/muxer.ts](src/mux/ts/muxer.ts) | n/a | Fresh — top-level façade combining the writers |
+| [src/mux/ts/pat-pmt.ts](src/mux/ts/pat-pmt.ts) | n/a | Fresh — PAT/PMT section builders + CRC-32/MPEG-2 + ISO-639 language + registration_descriptor support |
+| [src/mux/ts/pes.ts](src/mux/ts/pes.ts) | inverse of [src/demux/pes.ts](src/demux/pes.ts) | Fresh — PES header + 33-bit PTS/DTS encoding (video / audio / private_stream_1) |
+| [src/mux/ts/muxer.ts](src/mux/ts/muxer.ts) | n/a | Fresh — top-level façade muxing video + N audio + N subtitle streams by DTS into one TS |
 
 ## Usage
 
@@ -125,6 +128,13 @@ Options:
                       each rendition writes to its own file in --audio-out-dir
 --audio-out-dir=<p>   directory for per-language audio files (required with --audio)
 --audio-group=<id>    restrict to a specific AUDIO GROUP-ID (e.g., audio_hq)
+--inline-subtitles=<langs>
+                      multiplex subtitle renditions inline as private PIDs
+                      (one PID per language, stream_type 0x06 carrying
+                      WebVTT cues on private_stream_1). Requires
+                      --output=ts-canonical and a master playlist with
+                      EXT-X-MEDIA TYPE=SUBTITLES entries. PMT-tagged with
+                      ISO 639 language + registration_descriptor "VTT ".
 --verbose, -v         log ABR decisions to stderr
 ```
 
@@ -167,6 +177,7 @@ await new Extractor({
 | `audioSelection` | `'all' \| string[]` | undefined | Spawn the per-file audio coordinator for these languages. Runs in parallel with the main video pipeline. |
 | `audioOutDir` | `string` | undefined | Required when `audioSelection` is set; one `.aac` file per language is written here. |
 | `audioPreferredGroup` | `string` | undefined | Pin the per-file coordinator to a specific AUDIO group-id. Disables ABR-group following. |
+| `inlineSubtitleLanguages` | `'all' \| string[]` | undefined | Multiplex SUBTITLES renditions inline as private PIDs (stream_type 0x06, private_stream_1 PES carrying WebVTT cue blocks verbatim). Requires `outputMode = ts-canonical`. PIDs assigned from `DEFAULT_SUBTITLE_PID_BASE` (0x110) in user-list order. |
 | `alignment` | `'auto' \| 'mediaSequence' \| 'cumulative'` | `'auto'` | Cross-variant segment alignment. `auto` = cumulative for VOD, mediaSequence for live. |
 | `signal` | `AbortSignal` | undefined | Cancellation. The extractor's `run()` rejects with `AbortError` on signal. |
 | `log` | `(msg: string) => void` | no-op | One-line status events (ABR decisions, init reloads, skip-to-live, etc.). |
@@ -219,6 +230,19 @@ new Extractor({
 }).run();
 ```
 
+**Inline-mux subtitles into the canonical TS:**
+
+```ts
+new Extractor({
+  url, sink,
+  outputMode: makeOutputMode('ts-canonical'),
+  inlineAudioLanguages: ['nor'],            // optional — combine with audio
+  inlineSubtitleLanguages: ['eng', 'nor'],  // → PIDs 0x110, 0x111
+}).run();
+```
+
+The output TS carries one private-data PID per language (stream_type 0x06, stream_id 0xBD private_stream_1). Each PES packet is a verbatim WebVTT cue block (`00:00:01.500 --> 00:00:04.000\ntext\n`) with PTS = absolute cue start in 90 kHz units. PMT entries are tagged with both an ISO 639 language descriptor (when the source declared `LANGUAGE=`) and a registration_descriptor carrying the 4CC `"VTT "` so downstream demuxers can identify the carriage convention without out-of-band signalling. Subtitle PIDs survive SRT / RIST transports transparently — the routing fabric sees them as opaque private-data packets.
+
 **Slow-network preset:**
 
 ```ts
@@ -232,13 +256,14 @@ new Extractor({
 
 #### Other public exports
 
-- **Parsing**: `parseMaster`, `parseMedia`, `isMasterPlaylist`, `findSegmentAtTime`, `ParseError`.
+- **Parsing**: `parseMaster`, `parseMedia`, `isMasterPlaylist`, `findSegmentAtTime`, `ParseError`, `parseWebVttSegment`, `WebVttParseError`.
 - **ABR**: `AbrController`, `EwmaBandWidthEstimator`, `DEFAULT_ABR_CONFIG`, `UNSTABLE_NETWORK_ABR_CONFIG`.
 - **Live**: `LatencyController`, `DEFAULT_LATENCY_CONFIG`.
 - **Loader**: `NodeLoader`, `HttpError` — swap for tests or to inject auth.
-- **Demux / mux primitives**: `Demuxer`, `MpegTsMuxer`, `Fmp4AudioExtractor`, `Fmp4VideoExtractor`, ISO BMFF box helpers, PAT/PMT/PES builders. Useful when you have pre-fetched samples and want to mux them yourself.
+- **Demux / mux primitives**: `Demuxer`, `MpegTsMuxer`, `Fmp4AudioExtractor`, `Fmp4VideoExtractor`, ISO BMFF box helpers, PAT/PMT/PES builders (including `buildRegistrationDescriptor` for the `"VTT "` 4CC). Useful when you have pre-fetched samples and want to mux them yourself. Constants: `DEFAULT_VIDEO_PID` (0x100), `DEFAULT_AUDIO_PID` (0x101), `DEFAULT_SUBTITLE_PID_BASE` (0x110), `SUBTITLE_FORMAT_ID_WEBVTT` (`"VTT "`).
+- **Rendition coordinators**: `AudioCoordinator`, `AudioRenditionExtractor`, `SubtitleCoordinator`, `SubtitleRenditionExtractor` — drive a single or multiple per-language fetch+parse loops directly (bypassing the top-level `Extractor`).
 - **Crypto**: `decryptAes128Cbc`, `deriveIv`, `KeyCache`.
-- **Types**: `MasterPlaylist`, `MediaPlaylist`, `Variant`, `Segment`, `AlternateRendition`, `LoaderRequest`, `LoaderResult`.
+- **Types**: `MasterPlaylist`, `MediaPlaylist`, `Variant`, `Segment`, `AlternateRendition`, `LoaderRequest`, `LoaderResult`, `WebVttCue`, `ParsedWebVttSegment`, `SubtitleSampleIn`, `SubtitleStreamIn`.
 
 ## What works
 
@@ -255,6 +280,14 @@ new Extractor({
 - The per-file path **follows video ABR across AUDIO groups** — when video crosses a variant with a different `AUDIO="<group-id>"`, each per-language extractor swaps to the rendition in the new group mid-stream and re-anchors by cumulative EXTINF. Inline-mux stays on the initial group for the session (mid-stream codec-config changes in one PMT confuse most decoders).
 - **De-dup**: when `--inline-audio=eng` and `--audio=eng,fra` are both set, `eng` isn't fetched twice — the per-file coordinator excludes already-inlined languages.
 - **Format-agnostic**: raw-ADTS audio (with the Apple `com.apple.streaming.transportStreamTimestamp` ID3 PRIV anchor used as the segment-start PTS), MPEG-TS audio, and fMP4 / CMAF audio renditions all work.
+
+**Multi-language subtitles (inline-mux only).** WebVTT subtitle renditions are carried inline in the canonical TS — one private-data PID per language. The wire format is opaque to the routing layer (SRT / RIST carry the PIDs transparently); what the consumer does with the cues at the egress is its choice.
+- **Wire format.** Each subtitle PID has `stream_type = 0x06` (PES_PRIVATE) and carries PES packets with `stream_id = 0xBD` (private_stream_1). One PES per WebVTT cue. The PES payload is the cue block bytes verbatim — `00:00:01.500 --> 00:00:04.000\ncue text\n`, UTF-8. PTS is the absolute cue start in 90 kHz units, computed from the segment's `X-TIMESTAMP-MAP` (with PDT-derived fallback). PMT advertises each PID with an ISO 639 language descriptor (when the source declared `LANGUAGE=`) plus a `registration_descriptor` (tag 0x05) carrying 4CC `"VTT "`, so any downstream consumer can identify the carriage convention without out-of-band signalling.
+- **PID assignment.** PIDs increment from `DEFAULT_SUBTITLE_PID_BASE = 0x110` in user-list order. `--inline-subtitles=eng,nor` lands eng at 0x110 and nor at 0x111. `--inline-subtitles=all` follows master-playlist order.
+- **Group selection.** Mirror of inline-audio: filter renditions by language or NAME (case-insensitive), then pick the SUBTITLES `GROUP-ID` covering the most requested languages. Tie-break prefers the group the start variant advertises. Within the chosen group, multiple renditions for the same language dedupe by `DEFAULT=YES`.
+- **Cross-variant group following.** When video ABR crosses a variant with a different `SUBTITLES="<group-id>"`, each per-language subtitle extractor swaps to the rendition in the new group and re-anchors by cumulative EXTINF — same machinery as the per-file audio coordinator.
+- **Carryover dedup.** HLS WebVTT encoders include in-progress cues in every segment they overlap (so mid-stream joiners don't miss them). The rendition extractor maintains a `lastEmittedPts` watermark so each cue lands downstream exactly once; the watermark resets at `EXT-X-DISCONTINUITY` so post-discontinuity cues with lower MPEGTS PTS aren't dropped, and on seek + rendition swap for the same reason.
+- **Live + skip-on-stall.** When `--skip-on-stall` fires, the subtitle coordinator's `skipToLive()` jumps each rendition extractor's cursor to live-edge minus `liveStartOffsetSegments`, flushes the per-language cue buffers, and resets the dedup watermark — without this, late-arriving subtitle segments would emit cues with PTS far behind the new video PTS.
 
 **Source containers.** MPEG-TS native; fMP4 / CMAF demuxed sample-by-sample (moov / moof / traf / trun walked, mdat sliced). Length-prefixed NAL units are converted to Annex-B with SPS/PPS prepended on keyframes. Negative composition-time offsets (B-frame priming, common in CMAF) are handled by shifting PTS forward by `max(0, max(dts − pts))` so PTS ≥ DTS holds in the TS output.
 
@@ -312,6 +345,9 @@ Net effect: `unstable` is twitchier, more conservative, and quicker to bail — 
 - **Audio leads video by ≤ ~80 ms when the source uses negative composition offsets.** The fmp4 video extractor shifts all video PTS forward by `max(0, max(dts − pts))` so PTS ≥ DTS holds in MPEG-TS output; we mirror the same shift onto audio so AV stays in lockstep, but the absolute timeline of audio relative to video's *original* presentation time is offset by the shift. Bounded by the source's B-frame priming (typically 1–2 frames). Within sync-perception tolerance — no resync clicks.
 - **EXT-X-DISCONTINUITY in the source playlist resets continuity counters but doesn't set the TS-level discontinuity indicator.** Decoders may log CC errors when an upstream stream actually exercises this (rare — most production HLS streams are continuous). Cheap fix: also call `inlineAvMuxer.signalDiscontinuity()` when `segment.discontinuity` is true.
 - **Audio-track switching in ffplay (`a` key) jumps the timeline forward by ~1 s.** This is ffplay's read-ahead behaviour on pipe input: it accumulates ≥ 25 packets / ≥ 1 s of media per audio PID and the new decoder starts at the queue front, not at the current playback position. Not a hls-pipe bug; mpv handles the same input cleanly.
+- **`--inline-subtitles` supports plain WebVTT segments only.** HLS subtitle tracks delivered as raw `.vtt` text (the overwhelmingly common case) work. fMP4-wrapped WebVTT (CMAF subtitle tracks with `wvtt` sample entries) is not yet demuxed and would error on the first segment. TTML / IMSC / EBU-TT-D are out of scope for now; the source is already WebVTT and re-encoding into another text-subtitle format is wasted work that the consumer can do downstream if needed.
+- **`--inline-subtitles` does NOT carry cue duration as a separate field.** Each PES embeds the timing line (`start --> end`) inside the WebVTT cue block payload — downstream consumers parse it back. Standard WebVTT-aware tools work directly; consumers that expect a fixed-duration metadata frame format (CEA-style) need a small adapter.
+- **`--inline-subtitles` + live + non-aligned variants with subtitle-group ABR swaps is untested.** The cross-group swap re-anchors by cumulative EXTINF, which the README already calls out as unstable on live sliding-window playlists for audio. Same caveat applies to subtitles; PDT-based alignment is tracked in Future improvements (would fix both at once).
 
 ## Future improvements
 

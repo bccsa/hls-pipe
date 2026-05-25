@@ -21,6 +21,13 @@ export const StreamId = {
   VIDEO: 0xe0,
   /** First audio stream. Use 0xC0..0xDF for multiple. */
   AUDIO: 0xc0,
+  /**
+   * private_stream_1 — used here for WebVTT subtitle cues. Each cue is a
+   * complete PES packet with its own PTS; PES_packet_length is set to the
+   * actual payload length (private streams cannot use the length=0
+   * "unbounded" form that video uses).
+   */
+  PRIVATE_STREAM_1: 0xbd,
 } as const;
 
 export interface BuildPesOptions {

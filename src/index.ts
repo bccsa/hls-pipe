@@ -80,10 +80,29 @@ export {
   toAnnexB,
 } from './demux/fmp4/video.js';
 export type { VideoSample as Fmp4VideoSample } from './demux/fmp4/video.js';
-export { MpegTsMuxer } from './mux/ts/muxer.js';
-export type { VideoSampleIn, MpegTsMuxerOptions } from './mux/ts/muxer.js';
+export {
+  MpegTsMuxer,
+  DEFAULT_PMT_PID,
+  DEFAULT_VIDEO_PID,
+  DEFAULT_AUDIO_PID,
+  DEFAULT_SUBTITLE_PID_BASE,
+  SUBTITLE_FORMAT_ID_WEBVTT,
+} from './mux/ts/muxer.js';
+export type {
+  VideoSampleIn,
+  AudioSampleIn,
+  SubtitleSampleIn,
+  SubtitleStreamIn,
+  MpegTsMuxerOptions,
+} from './mux/ts/muxer.js';
 export { TsPacketWriter, PACKET_SIZE } from './mux/ts/packet.js';
-export { buildPat, buildPmt, withPointerField, crc32Mpeg2 } from './mux/ts/pat-pmt.js';
+export {
+  buildPat,
+  buildPmt,
+  buildRegistrationDescriptor,
+  withPointerField,
+  crc32Mpeg2,
+} from './mux/ts/pat-pmt.js';
 export type { PmtStreamSpec } from './mux/ts/pat-pmt.js';
 export { buildPes, StreamId } from './mux/ts/pes.js';
 export type { BuildPesOptions } from './mux/ts/pes.js';
@@ -92,6 +111,19 @@ export { FileSink } from './output/file-sink.js';
 export { AudioCoordinator } from './stream/audio-coordinator.js';
 export type { AudioLanguageSelection } from './stream/audio-coordinator.js';
 export { AudioRenditionExtractor } from './stream/audio-rendition-extractor.js';
+export { SubtitleCoordinator } from './stream/subtitle-coordinator.js';
+export type {
+  SubtitleLanguageSelection,
+  SubtitleTrackBinding,
+} from './stream/subtitle-coordinator.js';
+export { SubtitleRenditionExtractor } from './stream/subtitle-rendition-extractor.js';
+export type { SubtitleRenditionExtractorOptions } from './stream/subtitle-rendition-extractor.js';
+export {
+  parseWebVttSegment,
+  WebVttParseError,
+  WEBVTT_PTS_HZ,
+} from './parser/webvtt-parser.js';
+export type { WebVttCue, ParsedWebVttSegment } from './parser/webvtt-parser.js';
 export {
   detectAudioFormat,
   detectByUri,

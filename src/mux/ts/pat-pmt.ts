@@ -66,6 +66,35 @@ export interface PmtStreamSpec {
    * audio track. ffmpeg/ffplay surfaces it as `TAG:language` on the stream.
    */
   language?: string;
+  /**
+   * Optional additional descriptor bytes (raw, including tag+length+payload)
+   * appended to this stream's ES_info loop, after the ISO 639 descriptor if
+   * present. Used by the subtitle path to attach a registration_descriptor
+   * carrying the 4CC "VTT " so downstream demuxers recognise the PID as
+   * carrying WebVTT cues.
+   */
+  descriptors?: Uint8Array[];
+}
+
+/**
+ * Build a registration_descriptor (ISO/IEC 13818-1 §2.6.8, tag 0x05) wrapping
+ * a 4-character ASCII format_identifier. We use this to mark subtitle PIDs as
+ * carrying WebVTT ("VTT "). The 4CC is registered with SMPTE-RA but for our
+ * private-pipeline use any 4-byte tag suffices — downstream burn nodes match
+ * it explicitly.
+ */
+export function buildRegistrationDescriptor(formatIdentifier: string): Uint8Array {
+  if (formatIdentifier.length !== 4) {
+    throw new Error(`registration_descriptor format_identifier must be 4 chars, got ${formatIdentifier.length}`);
+  }
+  const out = new Uint8Array(6);
+  out[0] = 0x05; // descriptor_tag = registration_descriptor
+  out[1] = 0x04; // descriptor_length = 4
+  out[2] = formatIdentifier.charCodeAt(0) & 0xff;
+  out[3] = formatIdentifier.charCodeAt(1) & 0xff;
+  out[4] = formatIdentifier.charCodeAt(2) & 0xff;
+  out[5] = formatIdentifier.charCodeAt(3) & 0xff;
+  return out;
 }
 
 /**
@@ -87,7 +116,22 @@ export function buildPmt(
   if (streams.length === 0) throw new Error('PMT requires at least one stream');
   const pcrPid = streams[0]!.pid;
   // Precompute ES_info bytes per stream (variable length; 0 when no descriptors).
-  const esInfos = streams.map((s) => (s.language ? buildIso639LanguageDescriptor(s.language) : new Uint8Array(0)));
+  // Order: ISO 639 language descriptor (if any) first, then any caller-supplied
+  // descriptors (e.g. registration_descriptor for the subtitle PIDs).
+  const esInfos = streams.map((s) => {
+    const parts: Uint8Array[] = [];
+    if (s.language) parts.push(buildIso639LanguageDescriptor(s.language));
+    if (s.descriptors && s.descriptors.length > 0) parts.push(...s.descriptors);
+    if (parts.length === 0) return new Uint8Array(0);
+    const total = parts.reduce((acc, b) => acc + b.byteLength, 0);
+    const buf = new Uint8Array(total);
+    let off = 0;
+    for (const p of parts) {
+      buf.set(p, off);
+      off += p.byteLength;
+    }
+    return buf;
+  });
   const esInfoTotal = esInfos.reduce((acc, b) => acc + b.byteLength, 0);
   // Section body bytes (everything except table_id + first 2 length bytes):
   //   table_id(8) + section_syntax_indicator+0+reserved+section_length(16) +
