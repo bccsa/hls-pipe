@@ -66,7 +66,7 @@ export { readTrackFragments, MovieFragmentError } from './demux/fmp4/movie-fragm
 export type { TrackFragment, FragmentSample } from './demux/fmp4/movie-fragment.js';
 export { buildAdtsHeader, framesToAdts } from './demux/fmp4/aac-to-adts.js';
 export { Fmp4AudioExtractor } from './demux/fmp4/audio.js';
-export { extractAacFrames, parseId3v2Header, RawAacExtractError } from './demux/raw-aac.js';
+export { extractAacFrames, framesFromAdts, parseId3v2Header, RawAacExtractError } from './demux/raw-aac.js';
 export type { RawAacFrame } from './demux/raw-aac.js';
 export {
   readVideoTracks,

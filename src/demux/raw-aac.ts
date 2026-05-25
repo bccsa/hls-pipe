@@ -68,14 +68,25 @@ export function extractAacFrames(segment: Uint8Array): RawAacFrame[] {
     }
   }
 
-  const audioBytes = segment.subarray(offset);
+  return framesFromAdts(segment.subarray(offset), startPts);
+}
+
+/**
+ * Split a buffer of concatenated ADTS frames (no leading ID3, no container
+ * framing) into individual frames with per-frame PTS. Used by:
+ *   - `extractAacFrames` after stripping any ID3v2 prefix
+ *   - the MPEG-TS audio rendition path, which calls this on each audio PES
+ *     payload with `startPts` taken from the PES header
+ *
+ * Assumes a constant sample rate across the buffer (true for HLS audio
+ * renditions in practice — the rate comes from the rendition's CODECS attr).
+ */
+export function framesFromAdts(audioBytes: Uint8Array, startPts: number): RawAacFrame[] {
   if (audioBytes.byteLength < 7) return [];
 
-  // Determine sample rate from the first ADTS header (assume constant across
-  // the segment, which is true for raw-AAC renditions in practice).
   if (audioBytes[0] !== 0xff || (audioBytes[1]! & 0xf0) !== 0xf0) {
     throw new RawAacExtractError(
-      `expected ADTS sync 0xFFFx at byte ${offset} (after ID3); got 0x${audioBytes[0]?.toString(16) ?? '??'} 0x${audioBytes[1]?.toString(16) ?? '??'}`,
+      `expected ADTS sync 0xFFFx; got 0x${audioBytes[0]?.toString(16) ?? '??'} 0x${audioBytes[1]?.toString(16) ?? '??'}`,
     );
   }
   const firstSfi = (audioBytes[2]! >> 2) & 0x0f;

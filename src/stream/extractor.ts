@@ -48,7 +48,8 @@ import { LatencyController, type LatencyConfig } from './latency-controller.js';
 import { type OutputMode, TsPassthroughMode, TsCanonicalMode } from '../output/output-mode.js';
 import { Fmp4AudioExtractor } from '../demux/fmp4/audio.js';
 import { Fmp4VideoExtractor } from '../demux/fmp4/video.js';
-import { extractAacFrames } from '../demux/raw-aac.js';
+import { extractAacFrames, framesFromAdts } from '../demux/raw-aac.js';
+import { Demuxer } from '../demux/demuxer.js';
 import { MpegTsMuxer, DEFAULT_AUDIO_PID, DEFAULT_SUBTITLE_PID_BASE } from '../mux/ts/muxer.js';
 import { StreamType } from '../demux/pat-pmt.js';
 import { detectByContent } from './audio-format.js';
@@ -217,6 +218,13 @@ interface InlineAudioContext {
   /** Audio rendition's media playlist, refreshed alongside live video. */
   playlist: MediaPlaylist;
   extractor: Fmp4AudioExtractor;
+  /**
+   * Lazy-allocated TS demuxer for MPEG-TS audio renditions (rare but real —
+   * e.g. LongTail's audio group). One instance per language so PMT info
+   * (audio PID, stream_type) carries across segments. Undefined until the
+   * first TS audio segment is seen for this language.
+   */
+  tsDemuxer: Demuxer | undefined;
   /** URI of the most recent init segment loaded. */
   lastInitUri: string | undefined;
   /** Stable TS PID for this language in the canonical multi-stream TS. */
@@ -816,11 +824,30 @@ export class Extractor {
     const res = await this.loader.fetch(req);
     const sniffed = detectByContent(res.body);
 
-    // Format branch: raw ADTS (BCC-shape, possibly with leading ID3 PTS anchor)
-    // vs fMP4 (Brunstad-shape, with EXT-X-MAP init).
+    // Format branch:
+    //   raw ADTS (BCC-shape, possibly with leading ID3 PTS anchor)
+    //   MPEG-TS-wrapped AAC (LongTail-shape — AAC ADTS frames inside an
+    //     audio PID's PES packets; PTS comes from the PES header)
+    //   fMP4 (Brunstad-shape, with EXT-X-MAP init)
     if (sniffed === 'aac' || isId3Prefixed(res.body)) {
       // No init segment needed; ADTS frame split + ID3 PRIV timestamp anchors PTS.
       return extractAacFrames(res.body).map((f) => ({ data: f.data, pts: f.pts }));
+    }
+    if (sniffed === 'ts') {
+      if (!audio.tsDemuxer) audio.tsDemuxer = new Demuxer();
+      const demuxed = audio.tsDemuxer.demux(res.body);
+      // Each PES carries one or more concatenated ADTS frames. The PES header
+      // PTS is the timestamp of the first frame; subsequent frames within
+      // the same PES advance by `ticksPerFrame` (1024 samples × 90000 ÷ Hz).
+      // Only AAC ADTS is supported — LATM/LOAS or MP3/AC-3 inside TS would
+      // hit the sync-byte check in `framesFromAdts` and throw with context.
+      const out: { data: Uint8Array; pts: number }[] = [];
+      for (const pes of demuxed.audio) {
+        if (pes.pts === undefined) continue;
+        const frames = framesFromAdts(pes.data, pes.pts);
+        for (const f of frames) out.push({ data: f.data, pts: f.pts });
+      }
+      return out;
     }
     if (sniffed !== 'fmp4' && sniffed !== 'unknown') {
       throw new Error(
@@ -1143,6 +1170,7 @@ export class Extractor {
         rendition,
         playlist,
         extractor: new Fmp4AudioExtractor(),
+        tsDemuxer: undefined,
         lastInitUri: undefined,
         pid: nextPid,
         label,
