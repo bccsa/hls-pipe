@@ -1,0 +1,17 @@
+hls-pipe
+Copyright 2026 hls-pipe contributors
+
+This product is strongly inspired by, and contains portions derived from, hls.js:
+  https://github.com/video-dev/hls.js
+  Copyright (c) 2017 Dailymotion (http://www.dailymotion.com)
+  Licensed under the Apache License, Version 2.0
+
+Files in this project that are direct ports from hls.js carry an attribution
+header naming the upstream source file. Files marked "inspired by hls.js" are
+fresh implementations whose structure or algorithm was modeled on the upstream
+referenced in comments — they are not derivative works of hls.js source code.
+
+hls.js itself contains portions derived from videojs-contrib-hls:
+  https://github.com/videojs/videojs-contrib-hls
+  Copyright (c) 2013-2015 Brightcove
+  Licensed under the Apache License, Version 2.0
