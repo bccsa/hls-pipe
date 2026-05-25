@@ -151,10 +151,10 @@ function parseArgs(argv: string[]): ParsedArgs {
     } else if (arg.startsWith('--live-start=')) {
       const n = parseInt(arg.slice('--live-start='.length), 10);
       if (Number.isFinite(n) && n >= 0) liveStartOffsetSegments = n;
-    } else if (arg.startsWith('--start-time=')) {
-      const n = parseFloat(arg.slice('--start-time='.length));
+    } else if (arg.startsWith('--seek=')) {
+      const n = parseFloat(arg.slice('--seek='.length));
       if (!Number.isFinite(n) || n < 0) {
-        process.stderr.write(`error: invalid --start-time=${arg} (expected non-negative seconds)\n`);
+        process.stderr.write(`error: invalid --seek=${arg} (expected non-negative seconds)\n`);
         process.exit(2);
       }
       startTimeSec = n;
@@ -295,10 +295,12 @@ function printUsage(): void {
     '  --align=<strategy>    cross-variant alignment on ABR switches',
     '                        auto (default) | mediaSequence | cumulative',
     '                        (auto = cumulative for VOD, mediaSequence for live)',
-    '  --start-time=N        start at N seconds into the asset (VOD only;',
+    '  --seek=N              set the initial playhead, in seconds (VOD only;',
     '                        ignored with a warning on live streams).',
     '                        Out-of-range values clamp to the last playable',
-    '                        segment with a warning.',
+    '                        segment with a warning. The library exposes a',
+    '                        runtime seek() too; the CLI is single-shot so',
+    '                        this flag is the only entry point.',
     '  --verbose, -v         log ABR decisions and segment events to stderr',
     '  --help, -h            print this message',
     '',

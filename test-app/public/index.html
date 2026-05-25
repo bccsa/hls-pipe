@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>hls-pipe test harness</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <h1>hls-pipe test harness</h1>
+    <p class="sub">
+      Proxies the <code>hls-pipe</code> library to an <code>ffplay</code> window.
+      The video plays in a separate window (<code>-alwaysontop</code>, titled
+      <code>hls-pipe :: &lt;id&gt;</code>) — bring it to focus by clicking it.
+    </p>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>1 &middot; Start a session</h2>
+      <form id="start-form">
+        <label class="full">
+          <span>HLS URL</span>
+          <input type="url" name="url" id="url" required
+                 placeholder="https://example.com/master.m3u8" autocomplete="off" />
+        </label>
+
+        <details open>
+          <summary>Variant / ABR</summary>
+          <div class="grid-2">
+            <label>
+              <span>Quality</span>
+              <select name="quality">
+                <option value="auto">auto (ABR enabled)</option>
+                <option value="highest">highest</option>
+                <option value="lowest">lowest</option>
+                <option value="index:0">index:0</option>
+                <option value="index:1">index:1</option>
+                <option value="index:2">index:2</option>
+                <option value="maxBitrate:1000000">maxBitrate:1000000</option>
+                <option value="maxBitrate:3000000">maxBitrate:3000000</option>
+              </select>
+            </label>
+            <label>
+              <span>ABR preset</span>
+              <select name="abrPreset">
+                <option value="default">default</option>
+                <option value="unstable">unstable</option>
+              </select>
+            </label>
+            <label>
+              <span>Cap bitrate (bps, blank = none)</span>
+              <input type="number" name="capBitrate" min="0" step="100000" placeholder="0" />
+            </label>
+            <label>
+              <span>Alignment</span>
+              <select name="alignment">
+                <option value="auto">auto (VOD=cumulative, live=mediaSequence)</option>
+                <option value="mediaSequence">mediaSequence</option>
+                <option value="cumulative">cumulative</option>
+              </select>
+            </label>
+          </div>
+        </details>
+
+        <details>
+          <summary>Live / latency</summary>
+          <div class="grid-2">
+            <label>
+              <span>liveStartOffsetSegments</span>
+              <input type="number" name="liveStartOffsetSegments" min="0" placeholder="6" />
+            </label>
+            <label>
+              <span>liveSyncTargetSec</span>
+              <input type="number" name="liveSyncSec" min="0" step="0.1" placeholder="auto" />
+            </label>
+            <label>
+              <span>liveMaxLatencySec</span>
+              <input type="number" name="liveMaxLagSec" min="0" step="0.1" placeholder="30" />
+            </label>
+            <label class="checkbox">
+              <input type="checkbox" name="skipOnStall" />
+              <span>skipOnStall — jump to live edge on overflow</span>
+            </label>
+          </div>
+        </details>
+
+        <details>
+          <summary>Output transform</summary>
+          <div class="grid-2">
+            <label class="full">
+              <span>Output mode</span>
+              <select name="outputMode" id="outputMode">
+                <option value="ts-canonical">ts-canonical (default)</option>
+                <option value="ts">ts (passthrough)</option>
+                <option value="es-audio">es-audio (AAC ES)</option>
+                <option value="es-video">es-video (H.264 Annex-B)</option>
+              </select>
+            </label>
+          </div>
+        </details>
+
+        <details id="audio-section">
+          <summary>Inline audio (ts-canonical only)</summary>
+          <div class="grid-2">
+            <label class="full">
+              <span>Languages (comma-separated, or <code>all</code>; blank → all)</span>
+              <input type="text" name="inlineAudioLanguages"
+                     placeholder="eng,fra,nor  |  all  |  (blank = all)" autocomplete="off" />
+            </label>
+            <label class="checkbox">
+              <input type="checkbox" name="noInlineAudio" />
+              <span>--no-inline-audio (video-only canonical TS)</span>
+            </label>
+            <label class="checkbox">
+              <input type="checkbox" name="allowMonoAudio" />
+              <span>--allow-mono-audio</span>
+            </label>
+          </div>
+        </details>
+
+        <details>
+          <summary>Per-file audio extraction (writes to disk)</summary>
+          <div class="grid-2">
+            <label class="full">
+              <span>--audio: languages to extract to per-file outputs (blank → off)</span>
+              <input type="text" name="audio"
+                     placeholder="eng,fra,nor  |  all" autocomplete="off" />
+            </label>
+            <label>
+              <span>--audio-out-dir: server-side output directory</span>
+              <input type="text" name="audioOutDir"
+                     placeholder="./audio-out" autocomplete="off" />
+            </label>
+            <label>
+              <span>--audio-group: preferred AUDIO group-id</span>
+              <input type="text" name="audioGroup"
+                     placeholder="(any)" autocomplete="off" />
+            </label>
+          </div>
+        </details>
+
+        <div class="actions">
+          <button type="submit" id="start-btn">Start session</button>
+          <button type="button" id="stop-btn" disabled>Stop</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>2 &middot; Playback</h2>
+      <div id="status" class="status">
+        <div><strong>State:</strong> <span id="state">no session</span></div>
+        <div><strong>Session:</strong> <span id="session-id">—</span></div>
+        <div><strong>Output:</strong> <span id="media-out">0 s / 0 B</span></div>
+        <div><strong>ffplay pid:</strong> <span id="ffplay-pid">—</span></div>
+      </div>
+
+      <div class="controls">
+        <button type="button" id="pause-btn" disabled>Pause</button>
+        <button type="button" id="resume-btn" disabled>Resume</button>
+      </div>
+
+      <div class="controls">
+        <label>
+          <span>Playhead (seconds, VOD only)</span>
+          <input type="number" id="seek-input" min="0" step="0.1" placeholder="e.g. 30" />
+        </label>
+        <button type="button" id="seek-btn">Seek</button>
+      </div>
+      <p class="hint" id="seek-hint">
+        Before a session is running, this value is stashed and applied as the
+        initial playhead on Start. During playback it calls
+        <code>extractor.seek()</code>. Live streams: no-op (the library warns).
+        Out-of-range VOD values clamp to the last segment.
+      </p>
+      <p class="hint" id="pending-hint" hidden>
+        <strong>Pending:</strong> <span id="pending-value">0</span> s — will
+        apply on next session start.
+      </p>
+    </section>
+
+    <section class="card">
+      <h2>3 &middot; Log</h2>
+      <div class="log-controls">
+        <button type="button" id="clear-log-btn">Clear</button>
+        <label class="checkbox">
+          <input type="checkbox" id="autoscroll" checked />
+          <span>auto-scroll</span>
+        </label>
+      </div>
+      <pre id="log"></pre>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

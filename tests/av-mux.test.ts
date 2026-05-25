@@ -17,6 +17,7 @@ import { Fmp4AudioExtractor } from '../src/demux/fmp4/audio.js';
 import { Fmp4VideoExtractor } from '../src/demux/fmp4/video.js';
 import { MpegTsMuxer } from '../src/mux/ts/muxer.js';
 import { Demuxer } from '../src/demux/demuxer.js';
+import { TsCanonicalMode } from '../src/output/output-mode.js';
 
 const FIX = join(dirname(fileURLToPath(import.meta.url)), 'fixtures');
 const AUDIO_INIT = new Uint8Array(readFileSync(join(FIX, 'audio-init.mp4')));
@@ -112,5 +113,28 @@ describe('MpegTsMuxer.muxAv', () => {
     assert.equal(result.audio[0]!.pts, 4500);
     assert.equal(result.video[1]!.pts, 9000);
     assert.equal(result.audio[1]!.pts, 13500);
+  });
+});
+
+describe('TsCanonicalMode.resetContiguity', () => {
+  // Regression: seek() called resetContiguity which cleared initLoaded, but
+  // the extractor only re-fetches EXT-X-MAP when its URI changes. A seek
+  // within the same variant left the next segment without an init and threw
+  // "extractVideoSamples called before setInit" mid-playback.
+  it('keeps the fMP4 init loaded so the next segment still extracts', () => {
+    const mode = new TsCanonicalMode();
+    mode.setInit(VIDEO_INIT);
+    mode.resetContiguity();
+    const samples = mode.extractVideoSamples(VIDEO_SEG);
+    assert.ok(samples.length > 0, 'expected samples after resetContiguity');
+  });
+
+  it('transform() still works on fMP4 bytes after resetContiguity', () => {
+    const mode = new TsCanonicalMode();
+    mode.setInit(VIDEO_INIT);
+    mode.resetContiguity();
+    const ts = mode.transform(VIDEO_SEG);
+    assert.ok(ts.byteLength > 0);
+    assert.equal(ts[0], 0x47);
   });
 });

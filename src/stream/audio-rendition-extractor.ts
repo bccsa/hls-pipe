@@ -78,6 +78,11 @@ export class AudioRenditionExtractor {
   private playheadSec = 0;
   // Pending swap signaled by AudioCoordinator.
   private pendingRendition: AlternateRendition | undefined;
+  // Bumped on every successful seek(); the run loop snapshots this before a
+  // fetch and skips the post-write cursor advance if the seek beat the fetch
+  // home — without this guard, an in-flight pre-seek segment clobbers the
+  // seek's cursor update when it finishes writing.
+  private seekEpoch = 0;
 
   constructor(opts: AudioRenditionExtractorOptions) {
     if (!opts.rendition.uri) throw new Error('rendition has no URI');
@@ -111,6 +116,7 @@ export class AudioRenditionExtractor {
       this.throwIfAborted();
       if (this.opts.pauseGate) await this.opts.pauseGate();
       this.throwIfAborted();
+      const iterationSeekEpoch = this.seekEpoch;
 
       if (this.pendingRendition) {
         await this.applyRenditionSwap();
@@ -176,8 +182,10 @@ export class AudioRenditionExtractor {
         out = bytes;
       }
       await this.opts.sink.write(out, segment.duration);
-      this.cursorMediaSequence = segment.mediaSequence + 1;
-      this.playheadSec += segment.duration;
+      if (this.seekEpoch === iterationSeekEpoch) {
+        this.cursorMediaSequence = segment.mediaSequence + 1;
+        this.playheadSec += segment.duration;
+      }
 
       // For live, refresh playlist after consuming the known segments.
       if (this.isLive && this.cursorMediaSequence > lastSeq(this.playlist!)) {
@@ -268,6 +276,7 @@ export class AudioRenditionExtractor {
     }
     this.cursorMediaSequence = target.mediaSequence;
     this.playheadSec = target.startTimeSec;
+    this.seekEpoch++;
     // Drop fMP4 init binding so the next iteration re-checks initSection;
     // also reset format-first-sniff so an unusual seek-to-front-of-stream
     // re-runs detection.

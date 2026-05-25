@@ -179,6 +179,13 @@ interface ExtractorState {
    * (assigned at bootstrap). Empty when no inline audio is configured.
    */
   inlineAudios: InlineAudioContext[];
+  /**
+   * Monotonic counter bumped by every successful `seek()` call. The main loop
+   * snapshots this at iteration start; if it changes before the iteration's
+   * post-write cursor advance, we skip the advance so the seek's cursor
+   * update isn't clobbered by the in-flight pre-seek segment finishing.
+   */
+  seekEpoch: number;
 }
 
 interface InlineAudioContext {
@@ -355,6 +362,7 @@ export class Extractor {
     }
     state.cursorMediaSequence = target.mediaSequence;
     state.playheadSec = target.startTimeSec;
+    state.seekEpoch++;
     this.latency.setCursor(state.cursorMediaSequence);
     // Inline-audio: contexts follow video by mediaSequence each iteration; we
     // only need to break PTS continuity and drop init binding so a new init
@@ -435,6 +443,10 @@ export class Extractor {
       this.throwIfAborted();
       if (this.paused) await this.pauseGate;
       this.throwIfAborted();
+      // Capture the seek epoch at iteration start. If seek() bumps it before
+      // we reach the post-write cursor advance, the seek has retargeted
+      // cursorMediaSequence/playheadSec — we must NOT advance over it.
+      const iterationSeekEpoch = state.seekEpoch;
 
       // 1. Decide next level. Buffer signal comes from LatencyController
       //    (live-edge aware for live, generous constant for VOD).
@@ -563,9 +575,15 @@ export class Extractor {
         const outBytes = this.outputMode.transform(plaintext);
         await this.opts.sink.write(outBytes, segment.duration);
       }
-      state.cursorMediaSequence = segment.mediaSequence + 1;
-      state.playheadSec += segment.duration;
-      this.latency.setCursor(state.cursorMediaSequence);
+      if (state.seekEpoch === iterationSeekEpoch) {
+        state.cursorMediaSequence = segment.mediaSequence + 1;
+        state.playheadSec += segment.duration;
+        this.latency.setCursor(state.cursorMediaSequence);
+      } else {
+        this.log(
+          `seek occurred during fetch of seq=${segment.mediaSequence}; keeping cursor at seq=${state.cursorMediaSequence}`,
+        );
+      }
       if (segment.discontinuity) {
         this.outputMode.resetContiguity?.();
         this.inlineAvMuxer.reset();
@@ -880,6 +898,7 @@ export class Extractor {
       alignment,
       previousLevelIdx: startLevel,
       inlineAudios,
+      seekEpoch: 0,
     };
   }
 

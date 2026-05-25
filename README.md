@@ -277,6 +277,29 @@ The "buffer" ABR consults is the constraint it's trying to defend against. For a
 
 An earlier iteration used `mediaSecondsWritten − wallClockElapsed` from `StdoutSink`. That was wrong for instant-drain consumers (file writes, `head -c`, fast pipes) where the buffer grew unbounded and ABR ignored network signals; the live-edge-aware model replaces it.
 
+## ABR presets
+
+`--abr-preset=default` and `--abr-preset=unstable` (exported as `DEFAULT_ABR_CONFIG` / `UNSTABLE_NETWORK_ABR_CONFIG` from [src/abr/abr-controller.ts](src/abr/abr-controller.ts)) differ on six knobs:
+
+| Knob | default | unstable | Role |
+|---|---|---|---|
+| `ewmaSlowSec` | 9 | 4 | Slow EWMA half-life (s) — long-window bandwidth baseline. |
+| `ewmaFastSec` | 3 | 2 | Fast EWMA half-life (s) — recent-sample reactivity. |
+| `defaultEstimateBps` | 500 000 | 250 000 | Cold-start bandwidth guess before any samples land. |
+| `bwFactor` | 0.95 | 0.80 | Safety margin used when staying or down-switching. |
+| `bwUpFactor` | 0.70 | 0.60 | Stricter margin for up-switching. |
+| `maxStarvationDelaySec` | 4 | 2 | Seconds of projected starvation tolerated while picking a level. |
+
+How those flow into the controller (see [src/abr/abr-controller.ts](src/abr/abr-controller.ts) and the call sites in [src/stream/extractor.ts:453](src/stream/extractor.ts#L453) / [src/stream/extractor.ts:1067](src/stream/extractor.ts#L1067)):
+
+1. **Bandwidth estimate.** The EWMA estimator keeps two exponential averages and reports `min(fast, slow)` (pessimistic). Shorter half-lives in `unstable` make the estimate react faster to a sudden drop — fewer in-flight bytes before the controller "sees" the dip. Trade-off: more jitter and more switching on a steady pipe.
+2. **Cold start.** Until samples accrue, the estimator returns `defaultEstimateBps`. `unstable` starts at 250 kbps so the first level pick lands lower, avoiding an immediate abandon on a flaky connection.
+3. **Level selection (`findBestLevel`, port of hls.js).** The chosen level must satisfy `level.bitrate ≤ estimate × factor`, where `factor = bwUpFactor` on an up-switch and `bwFactor` otherwise. `unstable`'s 0.80 / 0.60 leaves more head-room — the picked level uses less of the estimated pipe, so a slow tick doesn't immediately starve the buffer.
+4. **Starvation tolerance.** `maxStarvationDelaySec` is how much projected starvation `findBestLevel` will accept while walking the ladder. Cutting it from 4 s to 2 s makes the search drop a rung sooner the moment `bufferAheadSec` (fed by `LatencyController.bufferForAbrSec()`) shrinks.
+5. **Mid-fragment abandon.** Same estimate + factors feed `shouldAbandon` on every progress tick, so `unstable` also abandons earlier and at a lower target level.
+
+Net effect: `unstable` is twitchier, more conservative, and quicker to bail — appropriate for lossy mobile, counter-productive on steady fat pipes (more spurious down-switches). For finer tuning than the two presets offer, pass a `Partial<AbrConfig>` via the library API's `abr:` option to override individual fields.
+
 ## What doesn't work yet
 
 - **`--output=es-audio` and `--output=es-video` still require MPEG-TS source.** For fMP4 sources, use `--output=ts-canonical` (re-muxes video to TS) or `--audio=<langs>` (writes per-language ADTS files).

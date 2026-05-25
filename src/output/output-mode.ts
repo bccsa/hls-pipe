@@ -233,8 +233,11 @@ export class TsCanonicalMode implements OutputMode {
   }
 
   resetContiguity(): void {
-    // Init segment is re-loaded by the extractor on the next segment.
-    this.initLoaded = false;
+    // Init carries per-variant codec params and survives both
+    // EXT-X-DISCONTINUITY and seeks within the same variant. The extractor
+    // re-fetches it when the init URI changes (i.e., on variant switches),
+    // so clearing initLoaded here would strand the next segment without an
+    // init after a seek that doesn't cross a variant boundary.
   }
 }
 

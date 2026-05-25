@@ -173,6 +173,85 @@ describe('Extractor seek()', () => {
     });
     await assert.rejects(() => e.seek(10), /before run/);
   });
+
+  // Regression: a pause+seek+resume issued while a segment fetch was in flight
+  // used to be clobbered by the in-flight iteration's post-write cursor advance
+  // (cursor jumped to N+1 instead of staying on the seek target). The seek log
+  // line was correct but the next fetched segment ignored it.
+  it('seeking during an in-flight fetch retargets the next fetch to the seek target', async () => {
+    // Loader holds the FIRST segment fetch so we can race a seek against it.
+    // All later fetches resolve immediately.
+    let releaseFirstSegment!: () => void;
+    const firstSegmentGate = new Promise<void>((resolve) => {
+      releaseFirstSegment = resolve;
+    });
+    const fetched: string[] = [];
+    let segmentFetches = 0;
+    const loader: Loader = {
+      async fetch(req: LoaderRequest): Promise<LoaderResult> {
+        fetched.push(req.url);
+        const body = req.url.endsWith('.m3u8')
+          ? new TextEncoder().encode(VOD_PLAYLIST)
+          : new Uint8Array();
+        if (req.kind === 'segment') {
+          segmentFetches++;
+          if (segmentFetches === 1) await firstSegmentGate;
+        }
+        return {
+          url: req.url,
+          status: 200,
+          headers: {},
+          body,
+          stats: { ttfbMs: 1, totalMs: 2, bytes: body.byteLength },
+        };
+      },
+    };
+
+    const abort = new AbortController();
+    const logs: string[] = [];
+    const e = new Extractor({
+      url: 'https://x/p.m3u8',
+      sink: makeSink(),
+      loader,
+      outputMode: new TsPassthroughMode(),
+      signal: abort.signal,
+      log: (m) => logs.push(m),
+    });
+
+    // Spin up the loop; we'll await it after we've forced our race.
+    const runPromise = e.run().catch(() => undefined);
+    // Wait until the first segment fetch is in flight.
+    for (let i = 0; i < 100 && segmentFetches === 0; i++) {
+      await new Promise((r) => setImmediate(r));
+    }
+    assert.equal(segmentFetches, 1, 'expected one in-flight segment fetch');
+
+    // Now race: pause, seek to seg2 (12s in), resume — all before the first
+    // fetch completes. The bug clobbers the seek cursor here.
+    e.pause();
+    const seekTarget = await e.seek(12);
+    assert.equal(seekTarget, 12, `seek returned ${seekTarget}`);
+    e.resume();
+
+    // Release the held first segment; the iteration finishes, writes seg0,
+    // then must NOT advance cursor — next fetch should be seg2, not seg1.
+    releaseFirstSegment();
+    // Wait until a second segment URL appears, then abort.
+    for (let i = 0; i < 100 && fetched.filter((u) => u.endsWith('.ts')).length < 2; i++) {
+      await new Promise((r) => setImmediate(r));
+    }
+    abort.abort();
+    await runPromise;
+
+    const tsFetches = fetched.filter((u) => u.endsWith('.ts'));
+    assert.ok(tsFetches.length >= 2, `expected ≥2 segment fetches; got ${tsFetches.join(',')}`);
+    assert.equal(tsFetches[0], 'https://x/seg0.ts', 'first fetch should be the pre-seek seg0');
+    assert.equal(
+      tsFetches[1],
+      'https://x/seg2.ts',
+      `post-seek fetch should jump to seg2; got ${tsFetches[1]}`,
+    );
+  });
 });
 
 // -- startTimeSec bootstrap behavior (VOD) --------------------------------
