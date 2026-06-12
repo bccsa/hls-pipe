@@ -10,6 +10,7 @@ export type { ExtractorOptions } from './stream/extractor.js';
 export { pickVariant, NoVariantsError } from './stream/variant-selector.js';
 export type { QualityHint } from './stream/variant-selector.js';
 export { StdoutSink } from './output/stdout-sink.js';
+export type { SegmentSink } from './output/stdout-sink.js';
 export { NodeLoader, HttpError } from './loader/node-loader.js';
 export type { NodeLoaderOptions } from './loader/node-loader.js';
 export {

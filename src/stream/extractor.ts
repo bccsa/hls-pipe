@@ -41,7 +41,7 @@ import {
 } from '../parser/m3u8-parser.js';
 import type { Loader, LoaderRequest, MediaPlaylist, Segment, Variant } from '../types.js';
 import { NodeLoader } from '../loader/node-loader.js';
-import type { StdoutSink } from '../output/stdout-sink.js';
+import type { SegmentSink } from '../output/stdout-sink.js';
 import { pickVariant, type QualityHint } from './variant-selector.js';
 import { PlaylistCache } from './playlist-cache.js';
 import { LatencyController, type LatencyConfig } from './latency-controller.js';
@@ -70,7 +70,7 @@ export interface ExtractorOptions {
   /** HLS URL — master playlist or media playlist. */
   url: string;
   /** Sink to receive segment bytes. */
-  sink: StdoutSink;
+  sink: SegmentSink;
   /** Loader instance (defaults to NodeLoader). */
   loader?: Loader;
   /**
