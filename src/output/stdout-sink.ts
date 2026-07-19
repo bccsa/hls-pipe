@@ -52,7 +52,7 @@ interface QueueEntry {
 /**
  * Minimal sink contract the Extractor writes to. Structural — any object with
  * a matching `write` satisfies it (StdoutSink, FileSink, or an embedder's own
- * sink such as media-router's PacedUdpTsSink).
+ * sink such as media-router's PacedUnixStreamTsSink).
  *
  * Ownership of `chunk` transfers to the sink: the extractor never reuses or
  * mutates the buffer after the call resolves, so sinks may retain zero-copy
