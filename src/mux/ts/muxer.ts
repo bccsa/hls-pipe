@@ -108,6 +108,25 @@ export interface MpegTsMuxerOptions {
  *   - `muxAv()` / `muxMulti()` accept video + N audio streams interleaved
  *     by DTS, with a multi-stream PMT
  */
+/**
+ * True media span (seconds) of a mux batch, from its video samples' DTS
+ * ladder: (last − first) plus one average frame duration. Segment EXTINF is
+ * only an approximation of this (rounded, GOP-quantized cuts) — pacing a
+ * sink by EXTINF makes wire delivery wander ±hundreds of ms around real
+ * time over consecutive segments (measured ±550–760 ms / ±0.7 % rate wobble
+ * on 6 s segments declared as flat 6.0), which downstream real-time
+ * consumers cannot smooth. Undefined for fewer than two samples — caller
+ * falls back to the declared duration.
+ */
+export function videoSpanSeconds(samples: ReadonlyArray<{ dts: number }>): number | undefined {
+  if (samples.length < 2) return undefined;
+  const first = samples[0]!.dts;
+  const last = samples[samples.length - 1]!.dts;
+  if (last <= first) return undefined;
+  const frameDur = (last - first) / (samples.length - 1);
+  return (last - first + frameDur) / 90000;
+}
+
 export class MpegTsMuxer {
   private readonly videoPid: number;
   private readonly audioPid: number;

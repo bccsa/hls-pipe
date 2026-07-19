@@ -50,7 +50,7 @@ import { Fmp4AudioExtractor } from '../demux/fmp4/audio.js';
 import { Fmp4VideoExtractor } from '../demux/fmp4/video.js';
 import { extractAacFrames, framesFromAdts } from '../demux/raw-aac.js';
 import { Demuxer } from '../demux/demuxer.js';
-import { MpegTsMuxer, DEFAULT_AUDIO_PID, DEFAULT_SUBTITLE_PID_BASE } from '../mux/ts/muxer.js';
+import { MpegTsMuxer, DEFAULT_AUDIO_PID, DEFAULT_SUBTITLE_PID_BASE, videoSpanSeconds } from '../mux/ts/muxer.js';
 import { StreamType } from '../demux/pat-pmt.js';
 import { detectByContent } from './audio-format.js';
 import type { AlternateRendition } from '../types.js';
@@ -648,13 +648,13 @@ export class Extractor {
         (state.inlineAudios.length > 0 || state.inlineSubtitles.length > 0) &&
         this.outputMode instanceof TsCanonicalMode
       ) {
-        const muxedBytes = await this.muxInlineAv(
+        const batches = await this.muxInlineAv(
           plaintext,
           segment,
           state.inlineAudios,
           state.inlineSubtitles,
         );
-        await this.opts.sink.write(muxedBytes, segment.duration);
+        for (const b of batches) await this.opts.sink.write(b.bytes, b.mediaSeconds);
       } else {
         // Transform via the output mode; zero-length output still advances the
         // sink's media clock so back-pressure math stays consistent.
@@ -691,7 +691,7 @@ export class Extractor {
     videoSegment: Segment,
     audios: InlineAudioContext[],
     subtitles: InlineSubtitleContext[] = [],
-  ): Promise<Uint8Array> {
+  ): Promise<Array<{ bytes: Uint8Array; mediaSeconds: number }>> {
     const tsMode = this.outputMode as TsCanonicalMode;
     const videoSamples = tsMode.extractVideoSamples(videoBytes);
     const ptsShift = tsMode.getVideoPtsShift();
@@ -782,11 +782,35 @@ export class Extractor {
       }];
     });
 
-    return this.inlineAvMuxer.muxMulti({
-      video: videoSamples,
-      audios: audioStreams,
-      subtitles: subtitleStreams,
-    });
+    // Mux in CONTENT-TIME buckets (~250 ms of DTS each) instead of one
+    // whole-segment batch. A paced byte-uniform sink spreads each write's
+    // bytes evenly across its declared span, so a whole-segment write puts
+    // every audio packet interleaved around an I-frame into that I-frame's
+    // contiguous byte span — a 200-350 ms audio-free hole on the wire every
+    // GOP (measured downstream as a 2 s-periodic stall that latency-less
+    // consumers can't ride out). Per-bucket writes keep audio flowing
+    // through I-frames; the muxer instance persists across calls, so CC and
+    // PSI stay continuous (PSI repeats per bucket — spec-friendly, ~1.5 %).
+    // Declared spans come from each bucket's video DTS ladder, never EXTINF
+    // (see videoSpanSeconds).
+    const buckets = partitionAvByDts(videoSamples, audioStreams, subtitleStreams);
+    if (buckets.length === 0) {
+      // Degenerate segment with no video ladder — one batch, EXTINF span.
+      const bytes = this.inlineAvMuxer.muxMulti({
+        video: videoSamples,
+        audios: audioStreams,
+        subtitles: subtitleStreams,
+      });
+      return [{ bytes, mediaSeconds: videoSegment.duration }];
+    }
+    return buckets.map((b) => ({
+      bytes: this.inlineAvMuxer.muxMulti({
+        video: b.video,
+        audios: b.audios,
+        subtitles: b.subtitles,
+      }),
+      mediaSeconds: b.spanSec,
+    }));
   }
 
   /**
@@ -1482,6 +1506,90 @@ export function clampStartTime(t: number, playlist: MediaPlaylist): number {
   if (!last) return 0;
   const upper = Math.max(0, playlist.totalDuration - last.duration);
   return Math.min(t, upper);
+}
+
+/** Content-time write granularity for the inline-AV mux: 250 ms @ 90 kHz. */
+const AV_WRITE_BUCKET_TICKS = 22_500;
+
+/** One content-time mux batch produced by `partitionAvByDts`. */
+export interface AvWriteBucket<V, A, S> {
+  video: V[];
+  audios: A[];
+  subtitles: S[];
+  /** True media span (s) this bucket covers on the output timeline. */
+  spanSec: number;
+}
+
+/**
+ * Partition one segment's mux inputs into ~250 ms content-time buckets, cut
+ * on the video DTS ladder. Why: a byte-uniform paced sink spreads each
+ * write's bytes evenly across its span, so writing a whole segment at once
+ * parks every audio packet that is interleaved around an I-frame inside that
+ * I-frame's contiguous byte span — a 200-350 ms audio-free hole on the wire
+ * every GOP. Small content-time writes keep every PID flowing through
+ * I-frames.
+ *
+ * Every bucket keeps the FULL audio/subtitle stream list (possibly with
+ * empty sample arrays) so the per-call PMT always announces the same stream
+ * set. Bucket spans telescope exactly: bucket k spans to bucket k+1's first
+ * video DTS; the last bucket adds one average frame duration — summing to
+ * precisely the whole segment's ladder span. Audio/subtitle samples index by
+ * PTS into the video buckets (clamped to the ends). Returns [] when there is
+ * no video to cut on — the caller falls back to a single whole-segment batch.
+ */
+export function partitionAvByDts<
+  V extends { dts: number },
+  A extends { samples: Array<{ pts: number }> },
+  S extends { samples: Array<{ pts: number }> },
+>(video: V[], audios: A[], subtitles: S[], bucketTicks = AV_WRITE_BUCKET_TICKS): Array<AvWriteBucket<V, A, S>> {
+  if (video.length === 0) return [];
+  const firstDts = video[0]!.dts;
+  const lastDts = video[video.length - 1]!.dts;
+  const avgFrameTicks = video.length > 1 ? (lastDts - firstDts) / (video.length - 1) : bucketTicks;
+
+  // Cut the video ladder into runs of >= bucketTicks.
+  const starts: number[] = []; // index into `video` where each bucket begins
+  let bucketStartDts = -Infinity;
+  for (let i = 0; i < video.length; i++) {
+    if (video[i]!.dts >= bucketStartDts + bucketTicks) {
+      starts.push(i);
+      bucketStartDts = video[i]!.dts;
+    }
+  }
+
+  const buckets = starts.map((s, k) => {
+    const end = k + 1 < starts.length ? starts[k + 1]! : video.length;
+    const spanTicks =
+      k + 1 < starts.length
+        ? video[starts[k + 1]!]!.dts - video[s]!.dts
+        : video[video.length - 1]!.dts - video[s]!.dts + avgFrameTicks;
+    return {
+      video: video.slice(s, end),
+      audios: audios.map((a) => ({ ...a, samples: [] as typeof a.samples })),
+      subtitles: subtitles.map((x) => ({ ...x, samples: [] as typeof x.samples })),
+      spanSec: spanTicks / 90000,
+    };
+  });
+
+  // Route audio/subtitle samples into buckets by PTS (clamped to the ends).
+  const startDts = starts.map((s) => video[s]!.dts);
+  const bucketIdx = (pts: number): number => {
+    let lo = 0;
+    let hi = startDts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (startDts[mid]! <= pts) lo = mid;
+      else hi = mid - 1;
+    }
+    return lo;
+  };
+  audios.forEach((a, ai) => {
+    for (const smp of a.samples) buckets[bucketIdx(smp.pts)]!.audios[ai]!.samples.push(smp);
+  });
+  subtitles.forEach((x, si) => {
+    for (const smp of x.samples) buckets[bucketIdx(smp.pts)]!.subtitles[si]!.samples.push(smp);
+  });
+  return buckets as Array<AvWriteBucket<V, A, S>>;
 }
 
 /** True if the buffer starts with an ID3v2 tag ("ID3" magic bytes). */

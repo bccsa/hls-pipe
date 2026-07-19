@@ -59,7 +59,10 @@ interface QueueEntry {
  * views over it indefinitely.
  */
 export interface SegmentSink {
-  /** `mediaSeconds` is the chunk's media duration (segment EXTINF; 0 for init sections). */
+  /** `mediaSeconds` is the chunk's TRUE media duration — the content-time span
+   *  the bytes cover (derived from the sample ladder for inline-AV writes;
+   *  segment EXTINF only on passthrough paths; 0 for init sections). Paced
+   *  sinks schedule wire delivery from this value. */
   write(chunk: Uint8Array, mediaSeconds: number): Promise<void>;
 }
 

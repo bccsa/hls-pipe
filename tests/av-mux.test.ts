@@ -15,7 +15,8 @@ import { dirname, join } from 'node:path';
 
 import { Fmp4AudioExtractor } from '../src/demux/fmp4/audio.js';
 import { Fmp4VideoExtractor } from '../src/demux/fmp4/video.js';
-import { MpegTsMuxer } from '../src/mux/ts/muxer.js';
+import { MpegTsMuxer, videoSpanSeconds } from '../src/mux/ts/muxer.js';
+import { partitionAvByDts } from '../src/stream/extractor.js';
 import { Demuxer } from '../src/demux/demuxer.js';
 import { TsCanonicalMode } from '../src/output/output-mode.js';
 
@@ -75,6 +76,50 @@ describe('MpegTsMuxer.muxAv', () => {
     assert.equal(result.streams.audioCodec, 'aac');
     assert.ok(result.video.length > 0, 'no video PES');
     assert.ok(result.audio.length > 0, 'no audio PES');
+  });
+
+  it('partitionAvByDts cuts content-time buckets whose spans telescope exactly', () => {
+    // 300 frames @ 20 ms = 6 s; 250 ms buckets → 24 buckets of ~12-13 frames.
+    const video = Array.from({ length: 300 }, (_, i) => ({ dts: i * 1800 }));
+    // One audio stream, 281 frames @ 21.33 ms spanning the same window.
+    const audios = [
+      { pid: 0x101, streamType: 0x0f, samples: Array.from({ length: 281 }, (_, i) => ({ pts: Math.round(i * 1920) })) },
+    ];
+    const buckets = partitionAvByDts(video, audios, []);
+    assert.ok(buckets.length >= 20 && buckets.length <= 26, `unexpected bucket count ${buckets.length}`);
+    // Every video sample lands in exactly one bucket, in order.
+    assert.equal(buckets.reduce((n, b) => n + b.video.length, 0), 300);
+    // Every audio sample routed exactly once; the stream LIST is present in
+    // every bucket (constant PMT), even where a bucket got no samples.
+    assert.equal(buckets.reduce((n, b) => n + b.audios[0]!.samples.length, 0), 281);
+    assert.ok(buckets.every((b) => b.audios.length === 1));
+    // Spans telescope to the full ladder span + one trailing frame = 6.000 s.
+    const total = buckets.reduce((s, b) => s + b.spanSec, 0);
+    assert.ok(Math.abs(total - 6.0) < 1e-9, `spans sum to ${total}`);
+    // Audio samples sit inside (or at the clamped edges of) their bucket's window.
+    for (let k = 0; k < buckets.length; k++) {
+      const start = buckets[k]!.video[0]!.dts;
+      const next = k + 1 < buckets.length ? buckets[k + 1]!.video[0]!.dts : Infinity;
+      for (const s of buckets[k]!.audios[0]!.samples) {
+        assert.ok((s.pts >= start || k === 0) && s.pts < next, `audio pts ${s.pts} outside bucket ${k}`);
+      }
+    }
+    // No video → no buckets (caller falls back to a single batch).
+    assert.deepEqual(partitionAvByDts([], audios, []), []);
+  });
+
+  it('videoSpanSeconds reports the true batch span from the DTS ladder', () => {
+    // 300 frames at 20 ms (50 fps): span = 299 steps + 1 frame = 6.000 s —
+    // regardless of what the playlist EXTINF claims.
+    const samples = Array.from({ length: 300 }, (_, i) => ({ dts: i * 1800 }));
+    assert.ok(Math.abs(videoSpanSeconds(samples)! - 6.0) < 1e-9);
+    // 302 frames = 6.04 s (a GOP-quantized long segment).
+    const long = Array.from({ length: 302 }, (_, i) => ({ dts: i * 1800 }));
+    assert.ok(Math.abs(videoSpanSeconds(long)! - 6.04) < 1e-9);
+    // Degenerate inputs fall back to the caller's declared duration.
+    assert.equal(videoSpanSeconds([]), undefined);
+    assert.equal(videoSpanSeconds([{ dts: 0 }]), undefined);
+    assert.equal(videoSpanSeconds([{ dts: 100 }, { dts: 100 }]), undefined);
   });
 
   it('stamps PCR on every video access unit, not only keyframes', () => {
