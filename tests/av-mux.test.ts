@@ -77,6 +77,34 @@ describe('MpegTsMuxer.muxAv', () => {
     assert.ok(result.audio.length > 0, 'no audio PES');
   });
 
+  it('stamps PCR on every video access unit, not only keyframes', () => {
+    // ISO 13818-1 wants PCR ≤ 100 ms apart; keyframe-only PCR (one per GOP)
+    // left receivers anchoring their timelines up to a GOP apart (measured
+    // 1.5 s A/V skew after a downstream re-mux). Every video AU's first TS
+    // packet must carry PCR, at the AU's DTS.
+    const video = [
+      { data: new Uint8Array([0, 0, 0, 1, 0x65]), pts: 0, dts: 0, isKeyframe: true },
+      { data: new Uint8Array([0, 0, 0, 1, 0x41]), pts: 3600, dts: 3600, isKeyframe: false },
+      { data: new Uint8Array([0, 0, 0, 1, 0x41]), pts: 7200, dts: 7200, isKeyframe: false },
+    ];
+    const ts = new MpegTsMuxer().muxAv({ video, audio: [] });
+    const pcrs: number[] = [];
+    for (let off = 0; off + 188 <= ts.byteLength; off += 188) {
+      const pid = ((ts[off + 1]! & 0x1f) << 8) | ts[off + 2]!;
+      const afc = (ts[off + 3]! >> 4) & 0x3;
+      if (pid !== 0x100 || !(afc & 0x2) || ts[off + 4]! < 7) continue;
+      if (!(ts[off + 5]! & 0x10)) continue; // PCR flag
+      const base =
+        ts[off + 6]! * 0x2000000 +
+        ts[off + 7]! * 0x20000 +
+        ts[off + 8]! * 0x200 +
+        ts[off + 9]! * 2 +
+        (ts[off + 10]! >> 7);
+      pcrs.push(base);
+    }
+    assert.deepEqual(pcrs, [0, 3600, 7200], 'expected one PCR per AU at its DTS');
+  });
+
   it('audio PES carries the correct PTS', () => {
     const aExt = new Fmp4AudioExtractor();
     aExt.setInit(AUDIO_INIT);

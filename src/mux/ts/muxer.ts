@@ -274,8 +274,16 @@ export class MpegTsMuxer {
           bytes: pes,
           payloadStart: true,
         };
+        // PCR on EVERY video access unit, not only keyframes. ISO 13818-1
+        // wants PCR at most 100 ms apart; keyframe-only PCR (one per GOP —
+        // 2 s on typical ladders) leaves receivers improvising a timeline
+        // for up to a GOP after joining mid-stream. Measured downstream in
+        // media-router: two gst tsdemux instances fed from this stream
+        // anchored their timelines 1.5 s apart, surfacing as constant A/V
+        // lipsync skew after a re-mux. Cost: 8 adaptation-field bytes on one
+        // packet per AU (20 ms cadence at 50 fps ⇒ ~3 kbps).
+        chunk.pcrBase = v.dts;
         if (v.isKeyframe) {
-          chunk.pcrBase = v.dts;
           chunk.randomAccess = true;
         }
         if (firstVideo && this.pendingDiscontinuity) {
