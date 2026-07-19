@@ -654,7 +654,16 @@ export class Extractor {
           state.inlineAudios,
           state.inlineSubtitles,
         );
-        for (const b of batches) await this.opts.sink.write(b.bytes, b.mediaSeconds);
+        let written = 0;
+        for (const b of batches) {
+          await this.opts.sink.write(b.bytes, b.mediaSeconds);
+          // Let the event loop TURN between writes: when the read-ahead
+          // buffer isn't full, sink.write resolves through microtasks only,
+          // so a whole segment's writes would otherwise run as one macrotask
+          // and starve the paced sink's drain timer — measured as a ~100 ms
+          // wire stall at every segment boundary.
+          if ((++written & 15) === 0) await new Promise<void>((r) => setImmediate(r));
+        }
       } else {
         // Transform via the output mode; zero-length output still advances the
         // sink's media clock so back-pressure math stays consistent.
@@ -782,17 +791,15 @@ export class Extractor {
       }];
     });
 
-    // Mux in CONTENT-TIME buckets (~250 ms of DTS each) instead of one
-    // whole-segment batch. A paced byte-uniform sink spreads each write's
-    // bytes evenly across its declared span, so a whole-segment write puts
-    // every audio packet interleaved around an I-frame into that I-frame's
-    // contiguous byte span — a 200-350 ms audio-free hole on the wire every
-    // GOP (measured downstream as a 2 s-periodic stall that latency-less
-    // consumers can't ride out). Per-bucket writes keep audio flowing
-    // through I-frames; the muxer instance persists across calls, so CC and
-    // PSI stay continuous (PSI repeats per bucket — spec-friendly, ~1.5 %).
-    // Declared spans come from each bucket's video DTS ladder, never EXTINF
-    // (see videoSpanSeconds).
+    // Mux in per-video-AU content-time buckets instead of one whole-segment
+    // batch (see AV_WRITE_BUCKET_TICKS): each write completes on the wire by
+    // its own content position, so downstream tsdemux!mpegtsmux consumers
+    // see a ~frame-interval AU cadence instead of a 130-220 ms void + flood
+    // around every large I-frame, and audio stays interleaved per frame.
+    // The muxer instance persists across calls, so CC and PSI stay
+    // continuous (PSI repeats per AU — 20 ms cadence at 50 fps, well inside
+    // the spec's ≤100 ms and ~2 % overhead). Declared spans come from each
+    // bucket's video DTS ladder, never EXTINF (see videoSpanSeconds).
     const buckets = partitionAvByDts(videoSamples, audioStreams, subtitleStreams);
     if (buckets.length === 0) {
       // Degenerate segment with no video ladder — one batch, EXTINF span.
@@ -803,14 +810,22 @@ export class Extractor {
       });
       return [{ bytes, mediaSeconds: videoSegment.duration }];
     }
-    return buckets.map((b) => ({
-      bytes: this.inlineAvMuxer.muxMulti({
-        video: b.video,
-        audios: b.audios,
-        subtitles: b.subtitles,
-      }),
-      mediaSeconds: b.spanSec,
-    }));
+    // Mux bucket-by-bucket with periodic event-loop yields (same rationale
+    // as the write loop: keep the paced drain timer serviced while a whole
+    // segment's worth of per-AU buckets is muxed).
+    const out: Array<{ bytes: Uint8Array; mediaSeconds: number }> = [];
+    for (const b of buckets) {
+      out.push({
+        bytes: this.inlineAvMuxer.muxMulti({
+          video: b.video,
+          audios: b.audios,
+          subtitles: b.subtitles,
+        }),
+        mediaSeconds: b.spanSec,
+      });
+      if ((out.length & 31) === 0) await new Promise<void>((r) => setImmediate(r));
+    }
+    return out;
   }
 
   /**
@@ -1217,9 +1232,13 @@ export class Extractor {
    * SubtitleRenditionExtractor loads its own when it starts. We just need
    * to pick the rendition + assign the PID + create the cue buffer here.
    *
-   * Returns [] when no inline-subtitle selection is configured. Throws when
-   * a non-empty selection cannot be satisfied (no matching renditions, or
-   * not running in `ts-canonical` mode).
+   * Returns [] when no inline-subtitle selection is configured — and ALSO
+   * when the selection cannot be satisfied by the CONTENT (no master
+   * playlist, no subtitle renditions, or none of the requested languages
+   * present), logged as a warning. Subtitles are additive: a URL swap to a
+   * source without them must degrade to audio+video, not crash-loop the
+   * player (a sticky module config outlives any one playlist). Only a true
+   * configuration error (wrong output mode) still throws.
    */
   private bootstrapInlineSubtitles(
     master: MasterPlaylist | undefined,
@@ -1232,11 +1251,11 @@ export class Extractor {
         'inlineSubtitleLanguages requires outputMode = ts-canonical (current mode does not support inline subtitles)',
       );
     }
-    if (!master) {
-      throw new Error('inlineSubtitleLanguages requires a master playlist with subtitle renditions');
-    }
-    if (master.subtitles.length === 0) {
-      throw new Error('inlineSubtitleLanguages: master playlist has no subtitle renditions');
+    if (!master || master.subtitles.length === 0) {
+      this.log(
+        'inline-subtitles: source has no subtitle renditions — continuing without subtitles',
+      );
+      return [];
     }
 
     // 1. Filter master.subtitles by the requested languages (or take all),
@@ -1268,9 +1287,10 @@ export class Extractor {
       if (v.length === 0) matchedByLang.delete(k);
     }
     if (matchedByLang.size === 0) {
-      throw new Error(
-        `inlineSubtitleLanguages: none of [${(sel === 'all' ? ['all'] : sel).join(',')}] found in master.subtitles`,
+      this.log(
+        `inline-subtitles: none of [${(sel === 'all' ? ['all'] : sel).join(',')}] found in master.subtitles — continuing without subtitles`,
       );
+      return [];
     }
 
     // 2. Build candidateGroups; pick group covering most languages.
@@ -1508,8 +1528,28 @@ export function clampStartTime(t: number, playlist: MediaPlaylist): number {
   return Math.min(t, upper);
 }
 
-/** Content-time write granularity for the inline-AV mux: 250 ms @ 90 kHz. */
-const AV_WRITE_BUCKET_TICKS = 22_500;
+/**
+ * Content-time write granularity for the inline-AV mux: one bucket per video
+ * access unit (any DTS advance starts a new bucket).
+ *
+ * Per-AU is load-bearing for downstream re-mux consumers, not a tuning
+ * choice: a paced byte-uniform sink spreads each write's bytes across its
+ * span, so a large I-frame inside a multi-frame bucket only finishes
+ * arriving `I-frame bytes ÷ bucket rate` after the previous AU. A
+ * `tsdemux ! mpegtsmux` consumer releases whole AUs on COMPLETION, so that
+ * arrival lag reproduces at its output as a total wire void followed by a
+ * line-rate flood (measured on .211 with 250 ms buckets: 130–220 ms voids
+ * every GOP/segment at the muxer output and at the SRT receiver — small
+ * receiver buffers drop frames on it). With one AU per write, the video
+ * pad's starvation is bounded by ~one frame interval, matching how every
+ * live gst producer on the bus emits. Egress pacing downstream cannot fix
+ * this instead: it can hold early data but never advance late data.
+ */
+const AV_WRITE_BUCKET_TICKS = 1;
+
+/** Span fallback when a bucket's frame duration is unknowable (single-frame
+ *  segment): one 25 fps frame @ 90 kHz. */
+const FALLBACK_FRAME_TICKS = 3_600;
 
 /** One content-time mux batch produced by `partitionAvByDts`. */
 export interface AvWriteBucket<V, A, S> {
@@ -1521,13 +1561,12 @@ export interface AvWriteBucket<V, A, S> {
 }
 
 /**
- * Partition one segment's mux inputs into ~250 ms content-time buckets, cut
- * on the video DTS ladder. Why: a byte-uniform paced sink spreads each
- * write's bytes evenly across its span, so writing a whole segment at once
- * parks every audio packet that is interleaved around an I-frame inside that
- * I-frame's contiguous byte span — a 200-350 ms audio-free hole on the wire
- * every GOP. Small content-time writes keep every PID flowing through
- * I-frames.
+ * Partition one segment's mux inputs into content-time buckets cut on the
+ * video DTS ladder — by default one bucket per video AU (see the
+ * `AV_WRITE_BUCKET_TICKS` rationale: whole-AU completion cadence on the wire
+ * is what keeps a downstream `tsdemux ! mpegtsmux` consumer from starving
+ * through large I-frames; coarser buckets re-create the void). `bucketTicks`
+ * stays a parameter for callers that want coarser runs.
  *
  * Every bucket keeps the FULL audio/subtitle stream list (possibly with
  * empty sample arrays) so the per-call PMT always announces the same stream
@@ -1545,7 +1584,8 @@ export function partitionAvByDts<
   if (video.length === 0) return [];
   const firstDts = video[0]!.dts;
   const lastDts = video[video.length - 1]!.dts;
-  const avgFrameTicks = video.length > 1 ? (lastDts - firstDts) / (video.length - 1) : bucketTicks;
+  const avgFrameTicks =
+    video.length > 1 ? (lastDts - firstDts) / (video.length - 1) : FALLBACK_FRAME_TICKS;
 
   // Cut the video ladder into runs of >= bucketTicks.
   const starts: number[] = []; // index into `video` where each bucket begins

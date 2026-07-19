@@ -78,17 +78,41 @@ describe('MpegTsMuxer.muxAv', () => {
     assert.ok(result.audio.length > 0, 'no audio PES');
   });
 
-  it('partitionAvByDts cuts content-time buckets whose spans telescope exactly', () => {
-    // 300 frames @ 20 ms = 6 s; 250 ms buckets → 24 buckets of ~12-13 frames.
+  it('partitionAvByDts defaults to one bucket per video AU', () => {
+    // Per-AU write granularity is load-bearing for downstream re-mux
+    // consumers (AU completion cadence at the paced wire) — a coarser
+    // default regresses the muxer-output void this fixed.
+    const video = Array.from({ length: 300 }, (_, i) => ({ dts: i * 1800 }));
+    const audios = [
+      { pid: 0x101, streamType: 0x0f, samples: Array.from({ length: 281 }, (_, i) => ({ pts: Math.round(i * 1920) })) },
+    ];
+    const buckets = partitionAvByDts(video, audios, []);
+    assert.equal(buckets.length, 300);
+    assert.ok(buckets.every((b) => b.video.length === 1));
+    // Spans telescope: 299 × 20 ms steps + one avg frame = exactly 6.000 s.
+    const total = buckets.reduce((s, b) => s + b.spanSec, 0);
+    assert.ok(Math.abs(total - 6.0) < 1e-9, `spans sum to ${total}`);
+    // Every audio sample routed exactly once; stream list constant.
+    assert.equal(buckets.reduce((n, b) => n + b.audios[0]!.samples.length, 0), 281);
+    assert.ok(buckets.every((b) => b.audios.length === 1));
+    // Single-frame segment gets the fallback frame span, not a ~0 span.
+    const single = partitionAvByDts([{ dts: 900_000 }], audios.map((a) => ({ ...a, samples: [] })), []);
+    assert.equal(single.length, 1);
+    assert.ok(single[0]!.spanSec >= 0.02, `degenerate span ${single[0]!.spanSec}`);
+  });
+
+  it('partitionAvByDts cuts coarser content-time buckets when asked', () => {
+    // 300 frames @ 20 ms = 6 s; explicit 250 ms buckets → 24 buckets of ~12-13 frames.
     const video = Array.from({ length: 300 }, (_, i) => ({ dts: i * 1800 }));
     // One audio stream, 281 frames @ 21.33 ms spanning the same window.
     const audios = [
       { pid: 0x101, streamType: 0x0f, samples: Array.from({ length: 281 }, (_, i) => ({ pts: Math.round(i * 1920) })) },
     ];
-    const buckets = partitionAvByDts(video, audios, []);
+    const buckets = partitionAvByDts(video, audios, [], 22_500);
     assert.ok(buckets.length >= 20 && buckets.length <= 26, `unexpected bucket count ${buckets.length}`);
     // Every video sample lands in exactly one bucket, in order.
     assert.equal(buckets.reduce((n, b) => n + b.video.length, 0), 300);
+    assert.ok(buckets.some((b) => b.video.length > 1), 'expected multi-frame buckets at 250 ms');
     // Every audio sample routed exactly once; the stream LIST is present in
     // every bucket (constant PMT), even where a bucket got no samples.
     assert.equal(buckets.reduce((n, b) => n + b.audios[0]!.samples.length, 0), 281);
