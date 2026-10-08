@@ -118,6 +118,15 @@ export type {
   SubtitleTrackBinding,
 } from './stream/subtitle-coordinator.js';
 export { SubtitleRenditionExtractor } from './stream/subtitle-rendition-extractor.js';
+export { VTT_PRIVATE_CARRIER, cueText, drainCues } from './stream/subtitle-carrier.js';
+export type {
+  ActiveCue,
+  DrainResult,
+  MuxWindow,
+  SubtitleCarrier,
+  SubtitleCueOut,
+  SubtitlePmtSpec,
+} from './stream/subtitle-carrier.js';
 export type { SubtitleRenditionExtractorOptions } from './stream/subtitle-rendition-extractor.js';
 export {
   parseWebVttSegment,

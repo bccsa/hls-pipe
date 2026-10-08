@@ -176,6 +176,34 @@ describe('MpegTsMuxer.muxMulti with subtitle streams', () => {
     assert.equal(entries[2]!.descriptors[4], 'a'.charCodeAt(0));
   });
 
+  it('a custom subtitleCarrier sets the PMT stream_type and descriptors (language first)', () => {
+    const video = [
+      { data: new Uint8Array([0, 0, 0, 1, 0x65]), pts: 0, dts: 0, isKeyframe: true },
+    ];
+    const subtitles = [
+      { pid: 0x180, language: 'nor', samples: [{ data: vttCue('hei'), pts: 90_000 }] },
+    ];
+    const ts = new MpegTsMuxer({
+      subtitleCarrier: { streamType: 0x06, descriptors: [buildRegistrationDescriptor('KLVA')] },
+    }).muxMulti({ video, audios: [], subtitles });
+    const pmtStart = findTableStart(ts, PACKET_SIZE, 0x02);
+    assert.ok(pmtStart > 0, 'PMT section not found');
+    const sectionLength = ((ts[pmtStart + 1]! & 0x0f) << 8) | ts[pmtStart + 2]!;
+    const esLoopEnd = pmtStart + 3 + sectionLength - 4;
+    let cursor = pmtStart + 12;
+    const entries: { streamType: number; pid: number; esInfo: string }[] = [];
+    while (cursor < esLoopEnd) {
+      const esInfoLen = ((ts[cursor + 3]! & 0x0f) << 8) | ts[cursor + 4]!;
+      entries.push({
+        streamType: ts[cursor]!,
+        pid: ((ts[cursor + 1]! & 0x1f) << 8) | ts[cursor + 2]!,
+        esInfo: Buffer.from(ts.subarray(cursor + 5, cursor + 5 + esInfoLen)).toString('hex'),
+      });
+      cursor += 5 + esInfoLen;
+    }
+    assert.deepEqual(entries[1], { streamType: 0x06, pid: 0x180, esInfo: '0a046e6f7200' + '05044b4c5641' });
+  });
+
   it('subtitle PES uses stream_id 0xBD (private_stream_1) and cue payload round-trips', () => {
     const cuePayload = vttCue('test cue');
     const subtitles = [

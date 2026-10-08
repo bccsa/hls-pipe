@@ -93,6 +93,14 @@ export interface MpegTsMuxerOptions {
   videoStreamType?: number;
   /** Stream type for the audio stream (default StreamType.AAC_ADTS). */
   audioStreamType?: number;
+  /**
+   * How the PMT announces subtitle PIDs: their stream_type and the ES
+   * descriptors attached to each (the ISO 639 language descriptor is added
+   * here when a stream declares a language, so leave it out). Default:
+   * stream_type 0x06 + registration_descriptor "VTT " — hls-pipe's
+   * verbatim-WebVTT convention. See `SubtitleCarrier`.
+   */
+  subtitleCarrier?: { streamType: number; descriptors: Uint8Array[] };
 }
 
 /**
@@ -134,6 +142,8 @@ export class MpegTsMuxer {
   private readonly programNumber: number;
   private readonly videoStreamType: number;
   private readonly audioStreamType: number;
+  private readonly subtitleStreamType: number;
+  private readonly subtitleDescriptors: Uint8Array[];
   private readonly writer = new TsPacketWriter();
   /**
    * Bumped on each `signalDiscontinuity()` call so the next PAT/PMT carries a
@@ -155,6 +165,10 @@ export class MpegTsMuxer {
     this.programNumber = opts.programNumber ?? 1;
     this.videoStreamType = opts.videoStreamType ?? StreamType.AVC;
     this.audioStreamType = opts.audioStreamType ?? StreamType.AAC_ADTS;
+    this.subtitleStreamType = opts.subtitleCarrier?.streamType ?? StreamType.PES_PRIVATE;
+    this.subtitleDescriptors = opts.subtitleCarrier?.descriptors ?? [
+      buildRegistrationDescriptor(SUBTITLE_FORMAT_ID_WEBVTT),
+    ];
   }
 
   /**
@@ -244,10 +258,10 @@ export class MpegTsMuxer {
         ...(a.language ? { language: a.language } : {}),
       })),
       ...subtitleStreams.map((s) => ({
-        streamType: StreamType.PES_PRIVATE,
+        streamType: this.subtitleStreamType,
         pid: s.pid,
         ...(s.language ? { language: s.language } : {}),
-        descriptors: [buildRegistrationDescriptor(SUBTITLE_FORMAT_ID_WEBVTT)],
+        descriptors: this.subtitleDescriptors,
       })),
     ];
     this.writeTables(streams);
@@ -321,12 +335,15 @@ export class MpegTsMuxer {
         });
         this.writer.writeChunk(task.pid, { bytes: pes, payloadStart: true });
       } else {
-        // Subtitle: private_stream_1 PES, PTS only (no DTS), no alignment flag.
+        // Subtitle: private_stream_1 PES, PTS only (no DTS). One complete
+        // cue per PES, so the data_alignment_indicator is set (as mpegtsmux
+        // does for its private streams).
         const s = task.sample;
         const pes = buildPes({
           streamId: StreamId.PRIVATE_STREAM_1,
           payload: s.data,
           pts: s.pts,
+          alignment: true,
         });
         this.writer.writeChunk(task.pid, { bytes: pes, payloadStart: true });
       }

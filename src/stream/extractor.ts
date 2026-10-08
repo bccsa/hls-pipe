@@ -50,7 +50,14 @@ import { Fmp4AudioExtractor } from '../demux/fmp4/audio.js';
 import { Fmp4VideoExtractor } from '../demux/fmp4/video.js';
 import { extractAacFrames, framesFromAdts } from '../demux/raw-aac.js';
 import { Demuxer } from '../demux/demuxer.js';
-import { MpegTsMuxer, DEFAULT_AUDIO_PID, DEFAULT_SUBTITLE_PID_BASE, videoSpanSeconds } from '../mux/ts/muxer.js';
+import { MpegTsMuxer, DEFAULT_AUDIO_PID, videoSpanSeconds, type SubtitleSampleIn } from '../mux/ts/muxer.js';
+import {
+  drainCues,
+  VTT_PRIVATE_CARRIER,
+  type ActiveCue,
+  type MuxWindow,
+  type SubtitleCarrier,
+} from './subtitle-carrier.js';
 import { StreamType } from '../demux/pat-pmt.js';
 import { detectByContent } from './audio-format.js';
 import type { AlternateRendition } from '../types.js';
@@ -141,13 +148,21 @@ export interface ExtractorOptions {
   /**
    * One or more subtitle rendition languages to multiplex inline with video
    * in `--output=ts-canonical`. Each language becomes its own subtitle PID
-   * (stream_type 0x06, stream_id 0xBD private_stream_1) carrying WebVTT cues
-   * in their original cue-block form. The PMT marks each PID with an ISO-639
-   * language descriptor and a registration_descriptor("VTT "). Pass `'all'`
-   * to include every subtitle language from the master playlist. Empty list
-   * / undefined means no subtitle PIDs.
+   * (stream_id 0xBD private_stream_1 PES, one cue per PES, written at the
+   * cue's start position in the stream — see `subtitle-carrier.ts`). What
+   * the PES carries and how the PMT announces the PID is the
+   * `subtitleCarrier`'s choice. Pass `'all'` to include every subtitle
+   * language from the master playlist. Empty list / undefined means no
+   * subtitle PIDs.
    */
   inlineSubtitleLanguages?: SubtitleLanguageSelection;
+  /**
+   * The wire format of the inline subtitle PIDs (PES payload per cue, PMT
+   * stream_type + descriptors, PID base, re-send cadence). Default
+   * `VTT_PRIVATE_CARRIER`: the WebVTT cue block verbatim, registration
+   * "VTT ", PIDs from 0x110, no re-sends.
+   */
+  subtitleCarrier?: SubtitleCarrier;
   /**
    * Initial cumulative media time (seconds) to start at. **VOD only.** On
    * live streams a warning is logged and the value is ignored. Out-of-range
@@ -198,7 +213,7 @@ interface ExtractorState {
   inlineAudios: InlineAudioContext[];
   /**
    * Inline-subtitle contexts. One per subtitle language. Each owns its TS
-   * subtitle PID (assigned at bootstrap from DEFAULT_SUBTITLE_PID_BASE) and
+   * subtitle PID (assigned at bootstrap from the carrier's pidBase) and
    * a per-language cue buffer that the SubtitleCoordinator's rendition
    * extractors append to. The main loop's `muxInlineAv` drains the buffers
    * each iteration.
@@ -250,10 +265,13 @@ interface InlineSubtitleContext {
   langKey: string;
   /**
    * Cue buffer — appended to by `SubtitleCoordinator`'s rendition extractor
-   * for this language, drained by `muxInlineAv` per video segment.
-   * Cues are in append (and therefore PTS-ascending) order.
+   * for this language, drained by `muxInlineAv` per video segment through
+   * `drainCues`: a cue leaves the buffer only once the video has reached
+   * its start, so the buffer holds whatever the subtitle playlist is ahead by.
    */
   cueBuffer: WebVttCue[];
+  /** The cue currently live on the wire (for the carrier's re-sends). */
+  active: ActiveCue | undefined;
 }
 
 export class Extractor {
@@ -278,7 +296,9 @@ export class Extractor {
    * counters and PCR continue cleanly — a fresh muxer per segment would cause
    * ffmpeg / ffplay to flag "Packet corrupt" at each segment boundary.
    */
-  private readonly inlineAvMuxer = new MpegTsMuxer();
+  private readonly inlineAvMuxer: MpegTsMuxer;
+  /** Wire format of the inline subtitle PIDs (see `ExtractorOptions.subtitleCarrier`). */
+  private readonly subtitleCarrier: SubtitleCarrier;
 
   /**
    * Pause gate awaited at the top of each main-loop (and audio-rendition) iteration.
@@ -296,6 +316,8 @@ export class Extractor {
     this.loader = opts.loader ?? new NodeLoader();
     this.log = opts.log ?? (() => undefined);
     this.abrEnabled = opts.fixedQuality === undefined;
+    this.subtitleCarrier = opts.subtitleCarrier ?? VTT_PRIVATE_CARRIER;
+    this.inlineAvMuxer = new MpegTsMuxer({ subtitleCarrier: this.subtitleCarrier });
     this.abr = new AbrController({ ...DEFAULT_ABR_CONFIG, ...(opts.abr ?? {}) });
     this.latency = new LatencyController(opts.latency ?? {});
     this.liveSyncTargetPinned = !!opts.latency?.liveSyncTargetSec;
@@ -429,7 +451,10 @@ export class Extractor {
     // Inline-subtitle coordinator: forward, and drop buffered cues — they
     // belong to the pre-seek timeline and would emit at wrong positions
     // after the seek otherwise.
-    for (const ctx of state.inlineSubtitles) ctx.cueBuffer.length = 0;
+    for (const ctx of state.inlineSubtitles) {
+      ctx.cueBuffer.length = 0;
+      ctx.active = undefined;
+    }
     if (this.subtitleCoordinator) await this.subtitleCoordinator.seek(clamped);
     // Discontinuity signaling — PTS will jump, decoders must reset.
     this.outputMode.resetContiguity?.();
@@ -580,7 +605,10 @@ export class Extractor {
           // Also flush any cues already drained into per-language buffers —
           // those belong to the pre-skip timeline.
           if (this.subtitleCoordinator && state.inlineSubtitles.length > 0) {
-            for (const ctx of state.inlineSubtitles) ctx.cueBuffer.length = 0;
+            for (const ctx of state.inlineSubtitles) {
+              ctx.cueBuffer.length = 0;
+              ctx.active = undefined;
+            }
             // Fire-and-forget: the coordinator awaits its own playlist
             // refresh internally. Keeping it non-blocking here matches the
             // main loop's existing pattern of synchronous cursor bumps.
@@ -772,23 +800,29 @@ export class Extractor {
       }];
     });
 
-    // Drain each subtitle context's cue buffer. Cues carry absolute 90 kHz
-    // PTS from the WebVTT parser; we apply the same ptsShift the audio path
-    // applies so subtitles stay in sync with the (shifted) video timeline.
-    // Buffer is monotonically PTS-ascending (cues appended in segment order
-    // by the background subtitle extractor).
-    const subtitleStreams = subtitles.flatMap((sub) => {
-      const cues = sub.cueBuffer.splice(0);
-      if (cues.length === 0) return [];
+    // Drain each subtitle context's cue buffer through the carrier's timing
+    // contract (subtitle-carrier.ts): a cue is written at its start position
+    // within this batch's window, future cues stay buffered, past-due ones
+    // go out at once with their remaining span. Cues carry absolute 90 kHz
+    // PTS from the WebVTT parser; the same ptsShift the audio path applies
+    // keeps them on the (shifted) video timeline. Every subtitle stream is
+    // listed in every batch, cues or not, so the PMT's stream list never
+    // flaps — a consumer tears down and re-creates its pads on a PMT change.
+    const window = muxWindow(videoSamples, audioStreams);
+    const subtitleStreams = subtitles.map((sub) => {
       const lang = sub.rendition.language;
-      return [{
-        pid: sub.pid,
-        samples: cues.map((c) => ({
-          data: c.payload,
-          pts: c.pts + ptsShift,
-        })),
-        ...(lang ? { language: lang } : {}),
-      }];
+      let samples: SubtitleSampleIn[] = [];
+      if (window) {
+        const drained = drainCues(sub.cueBuffer, sub.active, window, ptsShift, this.subtitleCarrier);
+        sub.active = drained.active;
+        samples = drained.samples;
+        if (drained.dropped > 0) {
+          this.log(
+            `inline-subtitle[${sub.label}]: ${drained.dropped} cue(s) had already ended when seq=${videoSegment.mediaSequence} was muxed (subtitle playlist lagging video); dropped`,
+          );
+        }
+      }
+      return { pid: sub.pid, samples, ...(lang ? { language: lang } : {}) };
     });
 
     // Mux in per-video-AU content-time buckets instead of one whole-segment
@@ -1052,7 +1086,7 @@ export class Extractor {
 
     // Phase 7b.3.2 + multi-language inline-audio bootstrap.
     const inlineAudios = await this.bootstrapInlineAudios(master);
-    // Inline-subtitle bootstrap (private PIDs starting at 0x110).
+    // Inline-subtitle bootstrap (private PIDs from the carrier's pidBase).
     const inlineSubtitles = this.bootstrapInlineSubtitles(
       master,
       variants[startLevel]!.subtitleGroup,
@@ -1226,7 +1260,7 @@ export class Extractor {
    * pick the SUBTITLES group covering the most requested languages (tied
    * groups break in favour of the one the start variant advertises), dedupe
    * by `isDefault=true` within a group. PIDs assigned from
-   * DEFAULT_SUBTITLE_PID_BASE in user order.
+   * the carrier's pidBase in user order.
    *
    * Unlike audio, subtitles don't need a media-playlist preload — the
    * SubtitleRenditionExtractor loads its own when it starts. We just need
@@ -1329,7 +1363,7 @@ export class Extractor {
     // 3. For each requested language, pick its rendition in the chosen group.
     //    Dedupe duplicates inside the group by preferring DEFAULT.
     const ctxs: InlineSubtitleContext[] = [];
-    let nextPid = DEFAULT_SUBTITLE_PID_BASE;
+    let nextPid = this.subtitleCarrier.pidBase;
     for (const [langKey, langRenditions] of matchedByLang) {
       const candidates = langRenditions.filter((r) => r.groupId === bestGroup);
       if (candidates.length === 0) {
@@ -1350,6 +1384,7 @@ export class Extractor {
         label,
         langKey,
         cueBuffer: [],
+        active: undefined,
       });
       nextPid++;
     }
@@ -1558,6 +1593,35 @@ export interface AvWriteBucket<V, A, S> {
   subtitles: S[];
   /** True media span (s) this bucket covers on the output timeline. */
   spanSec: number;
+}
+
+/**
+ * The output-timeline span `[startTicks, endTicks)` one mux batch covers:
+ * the video DTS ladder plus one (average) frame, or the audio span when the
+ * batch has no video. Undefined for a batch with no timed samples at all.
+ * This is the window `drainCues` writes subtitle cues into.
+ */
+export function muxWindow(
+  video: ReadonlyArray<{ dts: number }>,
+  audios: ReadonlyArray<{ samples: ReadonlyArray<{ pts: number }> }>,
+): MuxWindow | undefined {
+  if (video.length > 0) {
+    const first = video[0]!.dts;
+    const last = video[video.length - 1]!.dts;
+    const frame = video.length > 1 ? (last - first) / (video.length - 1) : FALLBACK_FRAME_TICKS;
+    return { startTicks: first, endTicks: last + frame };
+  }
+  let start = Infinity;
+  let end = -Infinity;
+  for (const a of audios) {
+    if (a.samples.length === 0) continue;
+    const first = a.samples[0]!.pts;
+    const last = a.samples[a.samples.length - 1]!.pts;
+    const frame = a.samples.length > 1 ? a.samples[1]!.pts - first : 1920;
+    start = Math.min(start, first);
+    end = Math.max(end, last + frame);
+  }
+  return Number.isFinite(start) ? { startTicks: start, endTicks: end } : undefined;
 }
 
 /**
